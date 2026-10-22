@@ -58,7 +58,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 set -Eeuo pipefail
 
@@ -104,6 +104,7 @@ BASE_PACKAGES=(
   ca-certificates curl git sudo
   build-essential pkg-config
   python3 python3-venv python3-pip iputils-ping net-tools
+  iproute2 iptables
 )
 
 # ------------------------------------------------------------------ runtime vars
@@ -674,14 +675,48 @@ Restart=always
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  if systemctl enable wgdashboard.service >/dev/null 2>&1; then
-    ok "Installed and enabled wgdashboard.service."
-  else
+  if ! systemctl enable wgdashboard.service >/dev/null 2>&1; then
     warn "Could not enable wgdashboard.service - check 'systemctl status wgdashboard'."
+    return 0
+  fi
+  systemctl start wgdashboard.service >/dev/null 2>&1 || true
+  sleep 3
+  if systemctl is-active --quiet wgdashboard.service; then
+    ok "Installed, enabled and started wgdashboard.service."
+  else
+    systemctl start wgdashboard.service >/dev/null 2>&1 || true
+    sleep 5
+    if systemctl is-active --quiet wgdashboard.service; then
+      ok "Installed, enabled and started wgdashboard.service."
+    else
+      warn "wgdashboard.service is not running - recent journal output follows:"
+      journalctl -u wgdashboard.service -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true
+      warn "Inspect with: journalctl -u wgdashboard.service -n 50 --no-pager"
+    fi
   fi
 }
 
 # ------------------------------------------------------------------ starter tunnels
+detect_wan_if() {
+  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+# v1.0.1 shipped seed configs with "Address" commented out. If a file is still
+# our untouched seed (marker present, no active Address, no [Peer] section),
+# make it functional: set the Address and add NAT hooks when WAN is known.
+upgrade_seed_config() { # $1=file  $2=address  $3=wan_if (optional)
+  local file="$1" address="$2" wan="$3"
+  [ -f "$file" ] || return 0
+  grep -q 'created by awg-suite-installer' "$file" 2>/dev/null || return 0
+  grep -q '^Address' "$file" 2>/dev/null && return 0
+  grep -q '^\[Peer\]' "$file" 2>/dev/null && return 0
+  sed -i "s|^# Address = .*$|Address = ${address}|" "$file" 2>/dev/null || true
+  if [ -n "$wan" ] && ! grep -q '^PostUp' "$file"; then
+    printf 'PostUp = iptables -A FORWARD -i %%i -j ACCEPT; iptables -t nat -A POSTROUTING -o %s -j MASQUERADE\nPostDown = iptables -D FORWARD -i %%i -j ACCEPT; iptables -t nat -D POSTROUTING -o %s -j MASQUERADE\n' "$wan" "$wan" >> "$file"
+  fi
+  ok "Upgraded seed ${file}: set ${address}${wan:+ + NAT via ${wan}}."
+}
+
 seed_tunnels() {
   hdr "Creating starter tunnel configs"
 
@@ -691,6 +726,16 @@ seed_tunnels() {
   fi
 
   umask 077
+
+  local wan_if nat_up nat_down
+  wan_if=$(detect_wan_if)
+  if [ -n "$wan_if" ]; then
+    nat_up="PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${wan_if} -j MASQUERADE"
+    nat_down="PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${wan_if} -j MASQUERADE"
+  else
+    warn "Could not detect the WAN interface - seeding without NAT rules."
+    warn "Add PostUp/PostDown MASQUERADE rules if peers need internet access."
+  fi
 
   if [ ! -f /etc/wireguard/wg0.conf ]; then
     local wg_priv
@@ -702,15 +747,16 @@ seed_tunnels() {
 [Interface]
 PrivateKey = ${wg_priv}
 ListenPort = ${OPT_WG_PORT}
-# Address = 10.10.0.1/24
-# PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-# PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+Address = 10.10.0.1/24
+${nat_up}
+${nat_down}
 EOF
     chmod 600 /etc/wireguard/wg0.conf
     SEEDED_WG=1
-    ok "Created /etc/wireguard/wg0.conf (UDP ${OPT_WG_PORT}, fresh keypair)."
+    ok "Created /etc/wireguard/wg0.conf (UDP ${OPT_WG_PORT}, 10.10.0.1/24, fresh keypair)."
   else
-    ok "/etc/wireguard/wg0.conf already exists - left untouched."
+    upgrade_seed_config /etc/wireguard/wg0.conf 10.10.0.1/24 "$wan_if"
+    ok "/etc/wireguard/wg0.conf already exists - left untouched (unless upgraded above)."
   fi
 
   if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then
@@ -731,13 +777,16 @@ H1 = 1234567
 H2 = 1234567
 H3 = 1234567
 H4 = 1234567
-# Address = 10.11.0.1/24
+Address = 10.11.0.1/24
+${nat_up}
+${nat_down}
 EOF
     chmod 600 /etc/amnezia/amneziawg/awg0.conf
     SEEDED_AWG=1
-    ok "Created /etc/amnezia/amneziawg/awg0.conf (UDP ${OPT_AWG_PORT}, fresh keypair + obfuscation params)."
+    ok "Created /etc/amnezia/amneziawg/awg0.conf (UDP ${OPT_AWG_PORT}, 10.11.0.1/24, fresh keypair + obfuscation params)."
   else
-    ok "/etc/amnezia/amneziawg/awg0.conf already exists - left untouched."
+    upgrade_seed_config /etc/amnezia/amneziawg/awg0.conf 10.11.0.1/24 "$wan_if"
+    ok "/etc/amnezia/amneziawg/awg0.conf already exists - left untouched (unless upgraded above)."
   fi
 
   save_state
@@ -749,31 +798,44 @@ enable_tunnel_services() {
     warn "systemd not running - tunnels will not be started here."
     return 0
   fi
-  if [ ! -e /dev/net/tun ]; then
-    warn "/dev/net/tun missing - not starting tunnels now (they are enabled and"
-    warn "will start on the next boot on a proper host/VM)."
-  fi
-  local started=()
+  local units=()
   if [ -f /etc/wireguard/wg0.conf ]; then
     if systemctl enable wg-quick@wg0.service >/dev/null 2>&1; then
-      started+=("wg-quick@wg0")
+      units+=("wg-quick@wg0")
     else
       warn "Could not enable wg-quick@wg0.service (missing wg-quick@.service?)."
     fi
   fi
   if [ -f /etc/amnezia/amneziawg/awg0.conf ]; then
     if systemctl enable awg-quick@awg0.service >/dev/null 2>&1; then
-      started+=("awg-quick@awg0")
+      units+=("awg-quick@awg0")
     else
       warn "Could not enable awg-quick@awg0.service (missing awg-quick@.service?)."
     fi
   fi
-  if [ "${#started[@]}" -gt 0 ] && [ -e /dev/net/tun ]; then
-    systemctl start "${started[@]}" 2>/dev/null || warn "One or more tunnels failed to start - check: journalctl -u 'wg-quick@*' -u 'awg-quick@*'"
-    ok "Enabled + started: ${started[*]}"
-  elif [ "${#started[@]}" -gt 0 ]; then
-    ok "Enabled: ${started[*]}"
+  [ "${#units[@]}" -gt 0 ] || return 0
+  if [ ! -e /dev/net/tun ]; then
+    warn "/dev/net/tun missing - tunnels are enabled and start on the next boot."
+    ok "Enabled: ${units[*]}"
+    return 0
   fi
+  local u failed=0
+  for u in "${units[@]}"; do
+    if ! systemctl start "${u}.service" >/dev/null 2>&1; then
+      sleep 2
+      systemctl start "${u}.service" >/dev/null 2>&1 || true
+    fi
+    if systemctl is-active --quiet "${u}.service"; then
+      ok "Started ${u}."
+    else
+      failed=1
+      warn "${u} did NOT start - recent journal output follows:"
+      journalctl -u "${u}.service" -n 12 --no-pager 2>/dev/null | sed 's/^/    /' || true
+      warn "Inspect with: journalctl -u ${u}.service -n 50 --no-pager"
+    fi
+  done
+  [ "$failed" -eq 0 ] && ok "All tunnel services active: ${units[*]}"
+  return 0
 }
 
 # ------------------------------------------------------------------ sysctl / firewall
@@ -784,8 +846,12 @@ configure_sysctl() {
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-  sysctl --system >/dev/null 2>&1 || warn "sysctl --system failed - forwarding may not be active until reboot."
-  ok "Wrote ${SYSCTL_FILE} (IPv4 + IPv6 forwarding)."
+  if sysctl --load="$SYSCTL_FILE" >/dev/null 2>&1; then
+    ok "Applied ${SYSCTL_FILE} - IPv4 + IPv6 forwarding active now."
+  else
+    warn "sysctl could not apply ${SYSCTL_FILE} immediately (conflicting settings"
+    warn "or container restriction). It will activate on the next boot."
+  fi
 }
 
 configure_firewall() {

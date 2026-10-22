@@ -32,6 +32,7 @@
 #    --awg-port N           seeded AmneziaWG listen port    (default 42666)
 #    --no-seed              do not create starter wg0/awg0 tunnel configs
 #    --no-dashboard         skip WGDashboard (also lifts the OS version floor)
+#    --no-adopt             scan for foreign installs but do not adopt them
 #    --no-auto-update       do not install the weekly auto-update systemd timer
 #    --awg-go-tag TAG       pin amneziawg-go to a specific upstream tag
 #    --awg-tools-tag TAG    pin amneziawg-tools to a specific upstream tag
@@ -58,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -70,6 +71,16 @@ SCRIPT_VERSION="1.0.4"
 #            (/var/backups/awg-suite/pre-adopt-<date>/). Dashboard database
 #            (logins/peers/settings) and tunnel configs/keys survive
 #            adoption intact; existing VPN clients are unaffected.
+#   v1.0.5 - Zero-touch standardization: adoption runs automatically when a
+#            live foreign install is detected (--no-adopt restores the old
+#            report-only behavior; any explicit --adopt-* flag also opts out
+#            of the automatic pass). Starter tunnels are no longer seeded
+#            onto servers that already run their own tunnels; an unused
+#            (peer-less) starter whose subnet collides with an existing
+#            tunnel is retired (backed up, unit disabled). A tunnel that is
+#            already up but not owned by systemd is taken over with a brief
+#            restart under the suite's unit. Dashboard start failures now
+#            name the process that holds the port.
 
 set -Eeuo pipefail
 
@@ -139,6 +150,7 @@ OPT_YES=0
 OPT_ADOPT_DASH_FROM=""
 OPT_ADOPT_AWG_CONF=0
 OPT_ADOPT_CLEAN_PATH=0
+OPT_NO_ADOPT=0
 ADOPT_BACKUP=""
 ADOPT_FINDINGS=0
 
@@ -605,6 +617,7 @@ AWG_CONF_DIR="/etc/amnezia/amneziawg"
 SHADOW_BIN_DIRS_DEFAULT="/usr/local/bin /usr/local/sbin"
 SYSTEMD_UNIT_DIR_DEFAULT="/etc/systemd/system"
 FOREIGN_DASH_CANDIDATES_DEFAULT="${DASHBOARD_DIR}/../WGDashboard /opt/wg-dashboard /root/wgdashboard /root/WGDashboard /srv/wgdashboard /usr/local/wgdashboard"
+ADOPTED_AWG_UNITS=""   # awg config names adopted this run (enabled at the end of install)
 
 looks_like_wgdashboard_dir() { [ -f "$1/src/wgd.sh" ]; }
 
@@ -769,9 +782,10 @@ adopt_dashboard_from() { # $1 = existing WGDashboard checkout directory
   pre_adopt_backup
   bname=$(basename "$dir")
 
-  # if we already manage a checkout at the canonical path, back it up too
-  if [ "$dir" != "$DASHBOARD_DIR" ] && [ -d "$DASHBOARD_DIR/.git" ]; then
-    warn "Suite-managed ${DASHBOARD_DIR} found - backing it up; the adopted dashboard replaces it."
+  # whatever sits at the canonical path (managed checkout or foreign copy)
+  # steps aside for the adopted dashboard
+  if [ "$dir" != "$DASHBOARD_DIR" ] && [ -d "$DASHBOARD_DIR" ]; then
+    warn "Existing ${DASHBOARD_DIR} found - backing it up; the adopted dashboard replaces it."
     sysdo stop wgdashboard.service 2>/dev/null || true
     move_to_backup "$DASHBOARD_DIR" "managed-wgdashboard"
   fi
@@ -865,6 +879,7 @@ adopt_awg_configs() {
       warn "Adopted ${name}.conf into ${AWG_CONF_DIR}; awg-quick@${name} not started"
       warn "yet - check: journalctl -u awg-quick@${name}.service -n 30 --no-pager"
     fi
+    ADOPTED_AWG_UNITS="${ADOPTED_AWG_UNITS:+${ADOPTED_AWG_UNITS} }${name}"
     moved=$((moved+1))
   done <<<"$confs"
   if [ "$moved" -gt 0 ]; then
@@ -895,20 +910,54 @@ adopt_clean_path() {
   return 0
 }
 
+adopt_dashboards_auto() { # v1.0.5: adopt the live foreign dashboard, if any
+  local picked="" p u n=0
+  while IFS=$'\t' read -r p u; do
+    [ -n "$p" ] || continue
+    n=$((n+1))
+    [ -n "$u" ] && picked="$p"   # a dashboard with its own systemd unit is live - prefer it
+  done < <(find_foreign_dashboards)
+  if [ -z "$picked" ]; then
+    # nothing live out there - stale copies stay put (nothing urgent to fix)
+    log "Foreign dashboard copy(ies) found without a systemd unit - left in place."
+    log "Standardize manually with: awg-suite install --adopt-dashboard-from <path>"
+    return 0
+  fi
+  log "Auto-adopting the live WGDashboard at ${picked} (database, peers and"
+  log "logins are preserved; the full original is backed up)."
+  adopt_dashboard_from "$picked"
+  if [ "$n" -gt 1 ]; then
+    warn "Multiple foreign WGDashboard installations found - adopted the live one (${picked})."
+    warn "Others were left untouched; use --adopt-dashboard-from <path> to pick a different one."
+  fi
+  return 0
+}
+
 run_adoption() {
   hdr "Adoption scan (pre-existing installs)"
   adoption_report
-  if [ "$ADOPT_FINDINGS" -gt 0 ] && [ -z "$OPT_ADOPT_DASH_FROM" ] \
-     && [ "$OPT_ADOPT_AWG_CONF" -eq 0 ] && [ "$OPT_ADOPT_CLEAN_PATH" -eq 0 ]; then
-    log "Nothing was changed in this section - re-run with the --adopt-* flags shown above to standardize."
+
+  # v1.0.5: with no --adopt-* flags and no --no-adopt, adoption is automatic.
+  local auto=0
+  if [ "$OPT_NO_ADOPT" -ne 1 ] && [ -z "$OPT_ADOPT_DASH_FROM" ] \
+     && [ "$OPT_ADOPT_AWG_CONF" -eq 0 ] && [ "$OPT_ADOPT_CLEAN_PATH" -eq 0 ] \
+     && [ "$ADOPT_FINDINGS" -gt 0 ]; then
+    auto=1
+    log "Adoption is automatic: everything found above is standardized in this run"
+    log "(full backups kept; pass --no-adopt to scan without adopting)."
   fi
+
   if [ -n "$OPT_ADOPT_DASH_FROM" ]; then
     adopt_dashboard_from "$OPT_ADOPT_DASH_FROM"
+  elif [ "$auto" -eq 1 ] && [ "$OPT_DASHBOARD" -eq 1 ]; then
+    adopt_dashboards_auto
+  elif [ "$auto" -eq 1 ]; then
+    log "Dashboard component disabled - foreign dashboards left as found."
   fi
-  if [ "$OPT_ADOPT_AWG_CONF" -eq 1 ]; then
+  if [ "$OPT_ADOPT_AWG_CONF" -eq 1 ] || [ "$auto" -eq 1 ]; then
     adopt_awg_configs
   fi
-  if [ "$OPT_ADOPT_CLEAN_PATH" -eq 1 ]; then
+  if [ "$OPT_ADOPT_CLEAN_PATH" -eq 1 ] || [ "$auto" -eq 1 ]; then
     adopt_clean_path
   fi
   return 0
@@ -1032,9 +1081,85 @@ EOF
       warn "wgdashboard.service is not running - recent journal output follows:"
       journalctl -u wgdashboard.service -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true
       warn "Inspect with: journalctl -u wgdashboard.service -n 50 --no-pager"
+      local holder
+      holder=$(ss -tlnp 2>/dev/null | awk -v p=":${OPT_DASH_PORT}\$" '$4 ~ p' | head -2 || true)
+      if [ -n "$holder" ]; then
+        warn "Port ${OPT_DASH_PORT} is currently held by:"
+        printf '%s\n' "$holder" | sed 's/^/    /'
+        warn "If that is an old WGDashboard, re-run 'awg-suite install' - adoption"
+        warn "retires it automatically and frees the port."
+      fi
     fi
   fi
 }
+
+# ------------------------------------------------------------------ v1.0.5 guards
+# Starter-collision and interface-takeover helpers for seed_tunnels() and
+# enable_tunnel_services(): pre-existing tunnels are left untouched unless a
+# suite-created starter config actively collides with them.
+
+subnet24_in_use() { # $1 = CIDR (e.g. 10.10.0.1/24)   $2 = interface to ignore
+  local net prefix base a
+  net="${1%/*}"; prefix="${1#*/}"
+  [ "$prefix" = "24" ] || return 1
+  base="${net%.*}"    # first three octets, e.g. 10.10.0
+  for a in $(ip -4 -o addr show 2>/dev/null | awk -v ign="$2" '$2 != ign {print $4}'); do
+    case "$a" in "${base}".*) return 0 ;; esac
+  done
+  return 1
+}
+
+is_pristine_starter() { # $1 = conf path: created by us and has no peers yet
+  [ -f "$1" ] || return 1
+  grep -q 'created by awg-suite-installer' "$1" 2>/dev/null || return 1
+  if grep -qE '^[[:space:]]*\[Peer\]' "$1" 2>/dev/null; then return 1; fi
+  return 0
+}
+
+foreign_confs_in_dir() { # $1 = dir   $2 = basename to skip (the starter)
+  local f
+  [ -d "$1" ] || return 0
+  for f in "$1"/*.conf; do
+    [ -f "$f" ] || continue
+    [ "$(basename "$f")" = "$2" ] && continue
+    basename "$f"
+  done
+  return 0
+}
+
+retire_colliding_starter() { # $1 = conf   $2 = systemd unit   $3 = subnet CIDR
+  # An unused (peer-less) starter config whose subnet is already occupied by
+  # an existing tunnel is pure dead weight - retire it (backup + unit off).
+  [ -f "$1" ] || return 1
+  is_pristine_starter "$1" || return 1
+  subnet24_in_use "$3" "$(basename "$1" .conf)" || return 1
+  if ! move_to_backup "$1" "starter-$(basename "$1")"; then
+    warn "Could not back up ${1} - leaving it in place."
+    return 1
+  fi
+  sysdo stop "$2" 2>/dev/null || true
+  sysdo disable "$2" 2>/dev/null || true
+  sysdo reset-failed "$2" 2>/dev/null || true
+  ok "Retired unused starter ${1}: subnet ${3} already serves an existing tunnel"
+  ok "(the starter had no peers; backup: ${ADOPT_BACKUP}/starter-$(basename "$1"))."
+  return 0
+}
+
+takeover_foreign_interface() { # $1 = iface   $2 = wg-quick|awg-quick   $3 = unit
+  # The interface is already up but systemd does not own it (typical for
+  # pre-existing installs) - restart it under the suite's unit so it becomes
+  # managed, monitored and boot-persistent. Brief blip, same config file.
+  ip link show "$1" >/dev/null 2>&1 || return 0
+  systemctl is-active --quiet "$3" && return 0
+  warn "$1 is already up but not via ${3} - restarting it under systemd (brief blip)."
+  if ! "$2" down "$1" >/dev/null 2>&1 || ip link show "$1" >/dev/null 2>&1; then
+    warn "Could not hand ${1} over cleanly - leaving it running unmanaged for now."
+    return 1
+  fi
+  ok "Stopped unmanaged ${1}; it restarts under ${3} next."
+  return 0
+}
+# ------------------------------------------------------------------ end v1.0.5 guards
 
 # ------------------------------------------------------------------ starter tunnels
 detect_wan_if() {
@@ -1085,6 +1210,12 @@ seed_tunnels() {
 
   umask 077
 
+  # v1.0.5: retire unused starter configs whose subnet is occupied by an
+  # existing (foreign) tunnel, and remember it so they are not re-seeded.
+  local wg_starter_retired=0 awg_starter_retired=0
+  retire_colliding_starter /etc/wireguard/wg0.conf wg-quick@wg0.service 10.10.0.1/24 && wg_starter_retired=1 || true
+  retire_colliding_starter /etc/amnezia/amneziawg/awg0.conf awg-quick@awg0.service 10.11.0.1/24 && awg_starter_retired=1 || true
+
   local wan_if nat_up nat_down
   wan_if=$(detect_wan_if)
   if [ -n "$wan_if" ]; then
@@ -1096,6 +1227,12 @@ seed_tunnels() {
   fi
 
   if [ ! -f /etc/wireguard/wg0.conf ]; then
+    if [ "$wg_starter_retired" -eq 1 ]; then
+      log "Not re-seeding wg0 - its subnet is already used by an existing tunnel."
+    elif [ -n "$(foreign_confs_in_dir /etc/wireguard wg0.conf)" ] && [ "$OPT_FORCE" -eq 0 ]; then
+      log "Existing tunnel configs found in /etc/wireguard - not seeding a starter wg0"
+      log "(this server already runs its own tunnels; --force seeds one anyway)."
+    else
     local wg_priv
     wg_priv=$(wg genkey)
     cat > /etc/wireguard/wg0.conf <<EOF
@@ -1112,12 +1249,19 @@ EOF
     chmod 600 /etc/wireguard/wg0.conf
     SEEDED_WG=1
     ok "Created /etc/wireguard/wg0.conf (UDP ${OPT_WG_PORT}, 10.10.0.1/24, fresh keypair)."
+    fi
   else
     upgrade_seed_config /etc/wireguard/wg0.conf 10.10.0.1/24 "$wan_if"
     ok "/etc/wireguard/wg0.conf already exists - left untouched (unless upgraded above)."
   fi
 
   if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then
+    if [ "$awg_starter_retired" -eq 1 ]; then
+      log "Not re-seeding awg0 - its subnet is already used by an existing tunnel."
+    elif [ -n "$(foreign_confs_in_dir /etc/amnezia/amneziawg awg0.conf)" ] && [ "$OPT_FORCE" -eq 0 ]; then
+      log "Existing tunnel configs found in /etc/amnezia/amneziawg - not seeding a starter awg0"
+      log "(this server already runs its own tunnels; --force seeds one anyway)."
+    else
     local awg_priv
     awg_priv=$(wg genkey)
     cat > /etc/amnezia/amneziawg/awg0.conf <<EOF
@@ -1144,6 +1288,7 @@ EOF
     chmod 600 /etc/amnezia/amneziawg/awg0.conf
     SEEDED_AWG=1
     ok "Created /etc/amnezia/amneziawg/awg0.conf (UDP ${OPT_AWG_PORT}, 10.11.0.1/24, fresh keypair + obfuscation params)."
+    fi
   else
     upgrade_seed_config /etc/amnezia/amneziawg/awg0.conf 10.11.0.1/24 "$wan_if"
     ok "/etc/amnezia/amneziawg/awg0.conf already exists - left untouched (unless upgraded above)."
@@ -1173,14 +1318,36 @@ enable_tunnel_services() {
       warn "Could not enable awg-quick@awg0.service (missing awg-quick@.service?)."
     fi
   fi
+  # v1.0.5: AWG configs adopted from /etc/wireguard earlier in this run must
+  # end up enabled + running even on a fresh install where awg-quick@.service
+  # did not exist yet at adoption time.
+  local adopted
+  for adopted in ${ADOPTED_AWG_UNITS:-}; do
+    systemctl is-active --quiet "awg-quick@${adopted}.service" && continue
+    if systemctl enable "awg-quick@${adopted}.service" >/dev/null 2>&1; then
+      units+=("awg-quick@${adopted}")
+    else
+      warn "Could not enable awg-quick@${adopted}.service (missing awg-quick@.service?)."
+    fi
+  done
   [ "${#units[@]}" -gt 0 ] || return 0
   if [ ! -e /dev/net/tun ]; then
     warn "/dev/net/tun missing - tunnels are enabled and start on the next boot."
     ok "Enabled: ${units[*]}"
     return 0
   fi
-  local u failed=0
+  local u ifc tool failed=0
   for u in "${units[@]}"; do
+    # v1.0.5: if the tunnel is already up but systemd does not own it (a
+    # pre-existing install started it), hand it over with a brief restart.
+    ifc="${u#*@}"
+    case "$u" in wg-quick@*) tool="wg-quick" ;; *) tool="awg-quick" ;; esac
+    if ! takeover_foreign_interface "$ifc" "$tool" "${u}.service" \
+       && ip link show "$ifc" >/dev/null 2>&1; then
+      warn "Leaving ${u} for the next boot (${ifc} runs from an unmanaged source)."
+      continue
+    fi
+    systemctl reset-failed "${u}.service" >/dev/null 2>&1 || true
     if ! systemctl start "${u}.service" >/dev/null 2>&1; then
       sleep 2
       systemctl start "${u}.service" >/dev/null 2>&1 || true
@@ -1194,6 +1361,10 @@ enable_tunnel_services() {
       jl="$(journalctl -u "${u}.service" -n 12 --no-pager 2>/dev/null || true)"
       printf '%s\n' "$jl" | sed 's/^/    /'
       warn "Inspect with: journalctl -u ${u}.service -n 50 --no-pager"
+      if printf '%s\n' "$jl" | grep -q 'Address already in use'; then
+        warn "Hint: another tunnel already uses this subnet. Edit 'Address =' in the"
+        warn "config, or remove the config file if the tunnel is unused."
+      fi
       case "$u" in
         awg-quick@*)
           if printf '%s\n' "$jl" | grep -q 'Invalid argument'; then
@@ -1669,9 +1840,14 @@ Options:
   --purge                uninstall: also delete configs, keys, dashboard data
   --yes, -y              assume yes everywhere
 
-Adoption options (standardize pre-existing installs):
+Adoption options (pre-existing installs):
+  Detection is automatic. When 'install' finds a live foreign install it is
+  adopted right away - full backups first, data preserved. Opt out with:
+  --no-adopt             scan and report, but do not adopt anything
+
+  Explicit overrides (these disable the automatic adoption above):
   --adopt-dashboard-from DIR
-                         adopt an existing WGDashboard checkout: relocate it
+                         adopt a specific WGDashboard checkout: relocate it
                          to /opt/wgdashboard under wgdashboard.service, keeping
                          its database (peers, logins, settings); the old copy
                          and units are backed up first
@@ -1680,9 +1856,8 @@ Adoption options (standardize pre-existing installs):
   --adopt-clean-path     remove wg/awg binaries under /usr/local that shadow
                          the suite's /usr/bin versions
 
-  (Detection is automatic: 'install' and 'status' report anything that needs
-   adopting; nothing is moved without the flags above, and every move is
-   backed up to /var/backups/awg-suite/pre-adopt-<date>/ first.)
+  (Every move is backed up to /var/backups/awg-suite/pre-adopt-<date>/ first;
+  the dashboard database and tunnel configs/keys always survive adoption.)
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash
@@ -1725,6 +1900,7 @@ parse_args() {
         shift 2 ;;
       --no-seed)         OPT_SEED=0; shift ;;
       --no-dashboard)    OPT_DASHBOARD=0; shift ;;
+      --no-adopt)        OPT_NO_ADOPT=1; shift ;;
       --no-auto-update)  OPT_AUTO_UPDATE=0; shift ;;
       --force)           OPT_FORCE=1; shift ;;
       --no-self-update)  OPT_SELF_UPDATE=0; shift ;;

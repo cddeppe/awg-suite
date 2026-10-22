@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.5"
+SCRIPT_VERSION="1.0.6"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -81,6 +81,14 @@ SCRIPT_VERSION="1.0.5"
 #            already up but not owned by systemd is taken over with a brief
 #            restart under the suite's unit. Dashboard start failures now
 #            name the process that holds the port.
+#   v1.0.6 - Port-collision awareness: a starter whose UDP listen port (not
+#            just its subnet) is already bound by an existing tunnel is now
+#            retired as well; starters whose interface exists are never
+#            retired (left to the takeover logic). Tunnel start failures
+#            name the interface/process that holds the colliding subnet or
+#            UDP port. After dashboard adoption, the login hints correctly
+#            point to the ORIGINAL credentials (restored database) instead
+#            of admin/admin; a state marker remembers the adoption.
 
 set -Eeuo pipefail
 
@@ -821,6 +829,11 @@ restore_adopted_dashboard_data() { # called by install_dashboard after clone/che
       ok "Restored adopted dashboard ${item}."
     fi
   done
+  # v1.0.6: remember the adoption so login hints point at the ORIGINAL
+  # credentials (the restored database keeps the old accounts, not admin/admin)
+  ADOPTED_DASH_RESTORED=1
+  touch "${STATE_DIR}/dashboard-adopted" 2>/dev/null || true
+  ok "Adopted database active - log in with your ORIGINAL credentials (not admin/admin)."
   # normalize ini port/bind to the values chosen for this install
   ini="${DASHBOARD_DIR}/src/wg-dashboard.ini"
   if [ -f "$ini" ]; then
@@ -1032,7 +1045,11 @@ EOF
   save_state
 
   ok "WGDashboard ${tag} installed in ${DASHBOARD_DIR}."
-  ok "Web UI: http://${PRIMARY_IP}:${OPT_DASH_PORT}  (default login: admin / admin - change it!)"
+  if [ "${ADOPTED_DASH_RESTORED:-0}" -eq 1 ]; then
+    ok "Web UI: http://${PRIMARY_IP}:${OPT_DASH_PORT}  (database restored - use your ORIGINAL login)"
+  else
+    ok "Web UI: http://${PRIMARY_IP}:${OPT_DASH_PORT}  (default login: admin / admin - change it!)"
+  fi
 }
 
 install_dashboard_service() {
@@ -1127,12 +1144,30 @@ foreign_confs_in_dir() { # $1 = dir   $2 = basename to skip (the starter)
   return 0
 }
 
-retire_colliding_starter() { # $1 = conf   $2 = systemd unit   $3 = subnet CIDR
-  # An unused (peer-less) starter config whose subnet is already occupied by
-  # an existing tunnel is pure dead weight - retire it (backup + unit off).
+port_in_use() { # $1 = UDP port - bound by any socket (kernel wg or userspace daemon)?
+  [ -n "${1:-}" ] || return 1
+  command -v ss >/dev/null 2>&1 || return 1
+  [ -n "$(ss -H -uln "sport = :$1" 2>/dev/null)" ]
+}
+
+retire_colliding_starter() { # $1 = conf   $2 = systemd unit   $3 = subnet CIDR   $4 = listen port
+  # An unused (peer-less) starter config whose subnet or UDP port is already
+  # occupied by an existing tunnel can never come up - retire it (backup +
+  # unit off).
   [ -f "$1" ] || return 1
+  local ifc; ifc="$(basename "$1" .conf)"
+  # If the interface exists at all (running, or waiting to be taken over by
+  # enable_tunnel_services), the starter is not dead weight - leave it alone.
+  ip link show "$ifc" >/dev/null 2>&1 && return 1
   is_pristine_starter "$1" || return 1
-  subnet24_in_use "$3" "$(basename "$1" .conf)" || return 1
+  local why=""
+  if subnet24_in_use "$3" "$ifc"; then
+    why="subnet ${3} already serves an existing tunnel"
+  elif port_in_use "${4:-}"; then
+    why="UDP port ${4} is already bound by an existing tunnel"
+  else
+    return 1
+  fi
   if ! move_to_backup "$1" "starter-$(basename "$1")"; then
     warn "Could not back up ${1} - leaving it in place."
     return 1
@@ -1140,7 +1175,7 @@ retire_colliding_starter() { # $1 = conf   $2 = systemd unit   $3 = subnet CIDR
   sysdo stop "$2" 2>/dev/null || true
   sysdo disable "$2" 2>/dev/null || true
   sysdo reset-failed "$2" 2>/dev/null || true
-  ok "Retired unused starter ${1}: subnet ${3} already serves an existing tunnel"
+  ok "Retired unused starter ${1}: ${why}"
   ok "(the starter had no peers; backup: ${ADOPT_BACKUP}/starter-$(basename "$1"))."
   return 0
 }
@@ -1210,11 +1245,12 @@ seed_tunnels() {
 
   umask 077
 
-  # v1.0.5: retire unused starter configs whose subnet is occupied by an
-  # existing (foreign) tunnel, and remember it so they are not re-seeded.
+  # v1.0.5: retire unused starter configs whose subnet (v1.0.6: or UDP listen
+  # port) is occupied by an existing (foreign) tunnel; remember it so they are
+  # not re-seeded.
   local wg_starter_retired=0 awg_starter_retired=0
-  retire_colliding_starter /etc/wireguard/wg0.conf wg-quick@wg0.service 10.10.0.1/24 && wg_starter_retired=1 || true
-  retire_colliding_starter /etc/amnezia/amneziawg/awg0.conf awg-quick@awg0.service 10.11.0.1/24 && awg_starter_retired=1 || true
+  retire_colliding_starter /etc/wireguard/wg0.conf wg-quick@wg0.service 10.10.0.1/24 "$OPT_WG_PORT" && wg_starter_retired=1 || true
+  retire_colliding_starter /etc/amnezia/amneziawg/awg0.conf awg-quick@awg0.service 10.11.0.1/24 "$OPT_AWG_PORT" && awg_starter_retired=1 || true
 
   local wan_if nat_up nat_down
   wan_if=$(detect_wan_if)
@@ -1361,9 +1397,31 @@ enable_tunnel_services() {
       jl="$(journalctl -u "${u}.service" -n 12 --no-pager 2>/dev/null || true)"
       printf '%s\n' "$jl" | sed 's/^/    /'
       warn "Inspect with: journalctl -u ${u}.service -n 50 --no-pager"
-      if printf '%s\n' "$jl" | grep -q 'Address already in use'; then
-        warn "Hint: another tunnel already uses this subnet. Edit 'Address =' in the"
-        warn "config, or remove the config file if the tunnel is unused."
+      if printf '%s\n' "$jl" | grep -qE 'Address already in use|File exists'; then
+        # v1.0.6: name the actual holder (subnet and/or UDP listen port)
+        local conf addr lport base a proc p sholders="" pholders=""
+        case "$u" in wg-quick@*) conf="/etc/wireguard/${ifc}.conf" ;; *) conf="/etc/amnezia/amneziawg/${ifc}.conf" ;; esac
+        addr=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$conf" 2>/dev/null | awk 'NR==1')
+        lport=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*//p' "$conf" 2>/dev/null | awk 'NR==1')
+        base="${addr%/*}"; base="${base%.*}"
+        if [ -n "$addr" ]; then
+          for a in $(ip -4 -o addr show 2>/dev/null | awk -v ign="$ifc" '$2 != ign {print $2"="$4}'); do
+            case "${a#*=}" in "${base}".*) sholders="${sholders} ${a%%=*}(${a#*=})" ;; esac
+          done
+        fi
+        if [ -n "$lport" ] && command -v ss >/dev/null 2>&1; then
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            proc=$(printf '%s\n' "$p" | sed -n 's/.*users(("\([^"]*\)".*/\1/p')
+            if [ -n "$proc" ]; then pholders="${pholders} ${proc}"; else pholders="${pholders} kernel-tunnel-socket"; fi
+          done < <(ss -H -uln "sport = :${lport}" 2>/dev/null)
+        fi
+        [ -n "$sholders" ] && warn "Hint: subnet ${base}.0/24 is already used by:${sholders}."
+        [ -n "$pholders" ] && warn "Hint: UDP port ${lport} is already bound by:${pholders}."
+        if [ -z "${sholders}${pholders}" ]; then
+          warn "Hint: another tunnel already uses this subnet or listen port."
+        fi
+        warn "Edit 'Address ='/'ListenPort =' in ${conf}, or remove the file if the tunnel is unused."
       fi
       case "$u" in
         awg-quick@*)
@@ -1518,7 +1576,11 @@ print_banner() {
   printf '  Auto-update  : %s\n' "$([ "$OPT_AUTO_UPDATE" -eq 1 ] && have_systemd && echo 'weekly systemd timer' || echo 'manual (awg-suite update)')"
   printf '%s\n' "-------------------------------------------------------------------------"
   printf '  Next steps:\n'
-  printf '    * Open the dashboard, log in (admin/admin) and SET A NEW PASSWORD.\n'
+  if [ "${ADOPTED_DASH_RESTORED:-0}" -eq 1 ]; then
+    printf '    * Open the dashboard and log in with your ORIGINAL credentials (adopted).\n'
+  else
+    printf '    * Open the dashboard, log in (admin/admin) and SET A NEW PASSWORD.\n'
+  fi
   printf '    * Add peers/tunnels from the dashboard, or edit the seeded configs.\n'
   printf '    * Tunnel services:  systemctl status wg-quick@wg0 awg-quick@awg0\n'
   printf '    * Suite management: awg-suite status | update | uninstall\n'
@@ -1804,7 +1866,11 @@ cmd_status() {
     printf '\nServices: systemd not running.\n'
   fi
 
-  printf '\nDashboard URL: http://%s:%s (login: admin/admin unless changed)\n' "$PRIMARY_IP" "$OPT_DASH_PORT"
+  if [ -f "${STATE_DIR}/dashboard-adopted" ]; then
+    printf '\nDashboard URL: http://%s:%s (login: your ORIGINAL credentials - dashboard was adopted)\n' "$PRIMARY_IP" "$OPT_DASH_PORT"
+  else
+    printf '\nDashboard URL: http://%s:%s (login: admin/admin unless changed)\n' "$PRIMARY_IP" "$OPT_DASH_PORT"
+  fi
 }
 
 usage() {

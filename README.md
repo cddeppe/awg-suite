@@ -55,8 +55,9 @@ since v1.0.5, **adopts it automatically** — full backups to
 - a tunnel that is **already up but not owned by systemd** is taken over with
   a brief restart under the suite's unit;
 - starter tunnels are **not seeded** onto servers that already run their own
-  tunnels, and an unused (peer-less) starter whose subnet collides with an
-  existing tunnel is retired.
+  tunnels, and an unused (peer-less) starter whose **subnet or UDP listen
+  port** collides with an existing tunnel is retired (backed up; starters
+  whose interface is live are never touched).
 
 To scan without adopting: `sudo awg-suite install --no-adopt` (or check
 `sudo awg-suite status`). The `--adopt-dashboard-from <path>`,
@@ -73,6 +74,12 @@ dashboard port/bind is standardized to the suite defaults (10086 / 0.0.0.0)
 during adoption — override with `--dashboard-port` / `--dashboard-bind` if you
 need to keep an old value.
 
+**After dashboard adoption, log in with your ORIGINAL credentials** — the
+restored database keeps the previous accounts; `admin` / `admin` only applies
+to brand-new installs. If a tunnel start ever fails with "Address already in
+use", the installer names the interface/process that holds the colliding
+subnet or UDP port.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it
@@ -82,7 +89,8 @@ from this repo's `master` branch**. Missed runs catch up after downtime
 
 ## After install
 
-- Dashboard: `http://<server-ip>:10086` — default login `admin` / `admin` (change it!)
+- Dashboard: `http://<server-ip>:10086` — default login `admin` / `admin` (change it!;
+  on adopted servers use the ORIGINAL credentials of the previous install)
 - Starter configs: `/etc/wireguard/wg0.conf` (UDP 51820) and
   `/etc/amnezia/amneziawg/awg0.conf` (UDP 42666) — existing files are never overwritten
   (re-running the installer does auto-repair seeds from older installer versions,

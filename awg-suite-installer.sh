@@ -58,18 +58,18 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 #
 # Changelog:
-#   v1.0.3 - AWG 3.x seed fix: H1-H4 are message-type ranges that must NOT
-#            overlap; v1.0.x seeds wrote the same value four times, which
-#            amneziawg-go rejects with EINVAL ("Unable to modify interface:
-#            Invalid argument"), so awg-quick@awg0 could never start.
-#            Existing v1.0.x seeds are migrated automatically on re-install.
-#          - WGDashboard dirty check now ignores untracked runtime files
-#            (venv/, db/, log/, __pycache__) - no more false-positive warning.
-#          - awg-quick failures that mention "Invalid argument" now print a
-#            hint about AWG 3.x obfuscation parameter rules.
+#   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
+#            pre-existing/foreign installs (WGDashboard in other locations,
+#            AWG configs in /etc/wireguard, wg/awg binaries in /usr/local
+#            shadowing /usr/bin) and report them; new --adopt-dashboard-from
+#            DIR, --adopt-awg-configs and --adopt-clean-path flags migrate
+#            them into the canonical layout with full backups first
+#            (/var/backups/awg-suite/pre-adopt-<date>/). Dashboard database
+#            (logins/peers/settings) and tunnel configs/keys survive
+#            adoption intact; existing VPN clients are unaffected.
 
 set -Eeuo pipefail
 
@@ -136,6 +136,11 @@ OPT_SELF_UPDATE=1
 OPT_AUTO=0
 OPT_PURGE=0
 OPT_YES=0
+OPT_ADOPT_DASH_FROM=""
+OPT_ADOPT_AWG_CONF=0
+OPT_ADOPT_CLEAN_PATH=0
+ADOPT_BACKUP=""
+ADOPT_FINDINGS=0
 
 # Environment (filled by detect_environment)
 DISTRO_ID="" DISTRO_VERSION="" DISTRO_CODENAME=""
@@ -590,6 +595,326 @@ dashboard_target_tag() {
   fi
 }
 
+# ------------------------------------------------------------------ adoption (v1.0.4)
+# Bring servers with pre-existing / non-standard installs under the suite's
+# canonical layout. Detection is always on (report-only, no changes); the
+# actual moves require explicit --adopt-* flags and are fully backed up.
+
+WG_CONF_DIR="/etc/wireguard"
+AWG_CONF_DIR="/etc/amnezia/amneziawg"
+SHADOW_BIN_DIRS_DEFAULT="/usr/local/bin /usr/local/sbin"
+SYSTEMD_UNIT_DIR_DEFAULT="/etc/systemd/system"
+FOREIGN_DASH_CANDIDATES_DEFAULT="${DASHBOARD_DIR}/../WGDashboard /opt/wg-dashboard /root/wgdashboard /root/WGDashboard /srv/wgdashboard /usr/local/wgdashboard"
+
+looks_like_wgdashboard_dir() { [ -f "$1/src/wgd.sh" ]; }
+
+unit_files_referencing_wgd() { # prints unit files whose ExecStart runs wgd.sh
+  local d f
+  for d in $SYSTEMD_UNIT_DIR_DEFAULT /usr/lib/systemd/system; do
+    for f in "$d"/*.service; do
+      [ -f "$f" ] || continue
+      if grep -q 'wgd\.sh' "$f" 2>/dev/null; then
+        printf '%s\n' "$f"
+      fi
+    done
+  done
+  return 0
+}
+
+unit_files_referencing_awg_conf() { # $1 = conf file path
+  local d f
+  for d in $SYSTEMD_UNIT_DIR_DEFAULT /usr/lib/systemd/system; do
+    for f in "$d"/*.service; do
+      [ -f "$f" ] || continue
+      if grep -q 'awg-quick' "$f" 2>/dev/null && grep -qF "$1" "$f" 2>/dev/null; then
+        printf '%s\n' "$f"
+      fi
+    done
+  done
+  return 0
+}
+
+find_foreign_dashboards() { # prints "path<TAB>unitfile" (ours excluded)
+  local p f root
+  for p in $FOREIGN_DASH_CANDIDATES_DEFAULT; do
+    [ -d "$p" ] || continue
+    looks_like_wgdashboard_dir "$p" || continue
+    printf '%s\t\n' "$p"
+  done
+  # a non-git copy at our own canonical path is foreign too
+  if [ -d "$DASHBOARD_DIR" ] && [ ! -d "$DASHBOARD_DIR/.git" ] && looks_like_wgdashboard_dir "$DASHBOARD_DIR"; then
+    printf '%s\t\n' "$DASHBOARD_DIR"
+  fi
+  # dashboards discovered via their systemd unit (any path)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    root=$(sed -n -E -e 's#^ExecStart=.*[[:space:]](/[^[:space:]]*)/src/wgd\.sh.*#\1#p' \
+                     -e 's#^WorkingDirectory=(/[^[:space:]]*)/src$#\1#p' "$f" | head -1)
+    [ -n "$root" ] || continue
+    [ -d "$root" ] || continue
+    # skip our own managed checkout + our canonical unit
+    if [ "$f" = "${SYSTEMD_UNIT_DIR_DEFAULT}/wgdashboard.service" ] && [ "$root" = "$DASHBOARD_DIR" ] && [ -d "$DASHBOARD_DIR/.git" ]; then
+      continue
+    fi
+    printf '%s\t%s\n' "$root" "$f"
+  done < <(unit_files_referencing_wgd)
+  return 0
+}
+
+find_awg_configs_in_wg_dir() { # AWG-style configs stranded in /etc/wireguard
+  local f
+  for f in "$WG_CONF_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    if grep -qE '^[[:space:]]*(Jc|Jmin|Jmax|S1|S2|S3|S4|H[1-4])[[:space:]]*=' "$f" 2>/dev/null; then
+      printf '%s\n' "$f"
+    fi
+  done
+  return 0
+}
+
+find_shadow_binaries() { # wg/awg binaries in /usr/local that shadow /usr/bin
+  local d b
+  for d in $SHADOW_BIN_DIRS_DEFAULT; do
+    for b in wg wg-quick awg awg-quick amneziawg-go; do
+      if [ -e "$d/$b" ]; then
+        printf '%s\n' "$d/$b"
+      fi
+    done
+  done
+  return 0
+}
+
+adoption_report() { # read-only scan; sets ADOPT_FINDINGS
+  ADOPT_FINDINGS=0
+  local dashes p unit uname awgconfs f shadows
+  dashes=$(find_foreign_dashboards | sort -u)
+  if [ -n "$dashes" ]; then
+    warn "Foreign WGDashboard installation(s) found:"
+    while IFS=$'\t' read -r p unit; do
+      [ -n "$p" ] || continue
+      uname=""
+      [ -n "$unit" ] && uname="  (unit: $(basename "$unit"))"
+      printf '      %s%s\n' "$p" "$uname"
+    done <<<"$dashes"
+    log "  -> standardize with: --adopt-dashboard-from <path>"
+    ADOPT_FINDINGS=$((ADOPT_FINDINGS+1))
+  fi
+  awgconfs=$(find_awg_configs_in_wg_dir)
+  if [ -n "$awgconfs" ]; then
+    warn "AmneziaWG-style configs inside ${WG_CONF_DIR} (they belong in ${AWG_CONF_DIR}):"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '      %s\n' "$f"
+    done <<<"$awgconfs"
+    log "  -> standardize with: --adopt-awg-configs"
+    ADOPT_FINDINGS=$((ADOPT_FINDINGS+1))
+  fi
+  shadows=$(find_shadow_binaries)
+  if [ -n "$shadows" ]; then
+    warn "wg/awg binaries under /usr/local shadow the suite's /usr/bin versions (PATH order):"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '      %s\n' "$f"
+    done <<<"$shadows"
+    log "  -> standardize with: --adopt-clean-path"
+    ADOPT_FINDINGS=$((ADOPT_FINDINGS+1))
+  fi
+  if [ -d /sys/module/amneziawg ]; then
+    log "AmneziaWG kernel module is loaded - tunnels may use the kernel path;"
+    log "the suite's userspace backend is installed alongside it (same configs)."
+  fi
+  if [ "$ADOPT_FINDINGS" -eq 0 ]; then
+    ok "No foreign WG/AWG/dashboard artifacts detected - layout already canonical."
+  fi
+  return 0
+}
+
+pre_adopt_backup() {
+  if [ -z "$ADOPT_BACKUP" ]; then
+    ADOPT_BACKUP="${BACKUP_DIR}/pre-adopt-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$ADOPT_BACKUP"
+    log "Adoption backup directory: ${ADOPT_BACKUP}"
+  fi
+  return 0
+}
+
+move_to_backup() { # $1=src path  $2=name inside the backup dir
+  pre_adopt_backup
+  if mv "$1" "$ADOPT_BACKUP/$2" 2>/dev/null; then
+    return 0
+  fi
+  cp -a "$1" "$ADOPT_BACKUP/$2" && rm -rf "$1"
+}
+
+stop_and_retire_dashboard_units() { # retire every unit that runs wgd.sh
+  local f base
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base=$(basename "$f")
+    sysdo stop "$base" 2>/dev/null || true
+    sysdo disable "$base" 2>/dev/null || true
+    move_to_backup "$f" "$base"
+    log "Retired old dashboard unit: ${base} (backed up; canonical unit reinstalled next)."
+  done < <(unit_files_referencing_wgd)
+  sysdo daemon-reload 2>/dev/null || true
+  return 0
+}
+
+adopt_dashboard_from() { # $1 = existing WGDashboard checkout directory
+  local dir="$1" bname staging item
+  [ -d "$dir" ] || die "Adoption source '${dir}' does not exist."
+  looks_like_wgdashboard_dir "$dir" || die "'${dir}' does not look like a WGDashboard checkout (no src/wgd.sh found)."
+  [ "$OPT_DASHBOARD" -eq 1 ] || die "--adopt-dashboard-from needs the dashboard component (drop --no-dashboard)."
+
+  pre_adopt_backup
+  bname=$(basename "$dir")
+
+  # if we already manage a checkout at the canonical path, back it up too
+  if [ "$dir" != "$DASHBOARD_DIR" ] && [ -d "$DASHBOARD_DIR/.git" ]; then
+    warn "Suite-managed ${DASHBOARD_DIR} found - backing it up; the adopted dashboard replaces it."
+    sysdo stop wgdashboard.service 2>/dev/null || true
+    move_to_backup "$DASHBOARD_DIR" "managed-wgdashboard"
+  fi
+
+  stop_and_retire_dashboard_units
+
+  # stage the data that must survive: db (peers/logins/settings), ini, logs
+  staging="${STATE_DIR}/adopt-dashboard-data"
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  for item in db log certbot.ini wg-dashboard.ini; do
+    if [ -e "$dir/src/$item" ]; then
+      cp -a "$dir/src/$item" "$staging/"
+      log "Staged for restore: ${item}"
+    fi
+  done
+
+  # move the whole old checkout into the adoption backup
+  move_to_backup "$dir" "$bname"
+  ok "Adopted dashboard from ${dir} (full original copy: ${ADOPT_BACKUP}/${bname})."
+  ok "Its database/settings will be restored into ${DASHBOARD_DIR} during this run."
+  return 0
+}
+
+restore_adopted_dashboard_data() { # called by install_dashboard after clone/checkout
+  local staging="${STATE_DIR}/adopt-dashboard-data" item ini old_port old_ip
+  [ -d "$staging" ] || return 0
+  [ -n "$(ls -A "$staging" 2>/dev/null)" ] || return 0
+  for item in db log certbot.ini wg-dashboard.ini; do
+    if [ -e "$staging/$item" ]; then
+      rm -rf "${DASHBOARD_DIR}/src/$item"
+      cp -a "$staging/$item" "${DASHBOARD_DIR}/src/"
+      ok "Restored adopted dashboard ${item}."
+    fi
+  done
+  # normalize ini port/bind to the values chosen for this install
+  ini="${DASHBOARD_DIR}/src/wg-dashboard.ini"
+  if [ -f "$ini" ]; then
+    old_port=$(sed -n 's/^app_port[[:space:]]*=[[:space:]]*//p' "$ini" | tail -1)
+    old_ip=$(sed -n 's/^app_ip[[:space:]]*=[[:space:]]*//p' "$ini" | tail -1)
+    if [ -n "$old_port" ] && [ "$old_port" != "$OPT_DASH_PORT" ]; then
+      warn "Adopted dashboard port ${old_port} -> ${OPT_DASH_PORT} (standardizing; update bookmarks)."
+      sed -i -E "s|^app_port[[:space:]]*=.*|app_port = ${OPT_DASH_PORT}|" "$ini"
+    fi
+    if [ -n "$old_ip" ] && [ "$old_ip" != "$OPT_DASH_BIND" ]; then
+      warn "Adopted dashboard bind ${old_ip} -> ${OPT_DASH_BIND} (standardizing)."
+      sed -i -E "s|^app_ip[[:space:]]*=.*|app_ip = ${OPT_DASH_BIND}|" "$ini"
+    fi
+  fi
+  return 0
+}
+
+adopt_awg_configs() {
+  local f name target moved=0 confs uf
+  confs=$(find_awg_configs_in_wg_dir)
+  if [ -z "$confs" ]; then
+    ok "No AmneziaWG configs found in ${WG_CONF_DIR} - nothing to adopt."
+    return 0
+  fi
+  pre_adopt_backup
+  mkdir -p "$AWG_CONF_DIR"
+  chmod 700 "$AWG_CONF_DIR" 2>/dev/null || true
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    name=$(basename "$f" .conf)
+    target="${AWG_CONF_DIR}/${name}.conf"
+    if [ -e "$target" ]; then
+      warn "${target} already exists - keeping it; ${f} left in place (resolve manually)."
+      continue
+    fi
+    # retire custom units that run awg-quick on the old path
+    while IFS= read -r uf; do
+      [ -n "$uf" ] || continue
+      sysdo stop "$(basename "$uf")" 2>/dev/null || true
+      sysdo disable "$(basename "$uf")" 2>/dev/null || true
+      move_to_backup "$uf" "$(basename "$uf")"
+      log "Retired custom unit $(basename "$uf") (backed up)."
+    done < <(unit_files_referencing_awg_conf "$f")
+    sysdo daemon-reload 2>/dev/null || true
+    # retire any (failing) wg-quick unit for this name, then move the config
+    sysdo disable "wg-quick@${name}.service" 2>/dev/null || true
+    sysdo reset-failed "wg-quick@${name}.service" 2>/dev/null || true
+    cp -p "$f" "$target"
+    chmod 600 "$target"
+    move_to_backup "$f" "wg-conf-${name}.conf"
+    if sysdo start "awg-quick@${name}.service" >/dev/null 2>&1; then
+      sysdo enable "awg-quick@${name}.service" >/dev/null 2>&1 || true
+      ok "Adopted ${name}.conf into ${AWG_CONF_DIR}; started awg-quick@${name}."
+    else
+      sysdo enable "awg-quick@${name}.service" >/dev/null 2>&1 || true
+      warn "Adopted ${name}.conf into ${AWG_CONF_DIR}; awg-quick@${name} not started"
+      warn "yet - check: journalctl -u awg-quick@${name}.service -n 30 --no-pager"
+    fi
+    moved=$((moved+1))
+  done <<<"$confs"
+  if [ "$moved" -gt 0 ]; then
+    ok "Adopted ${moved} AmneziaWG config(s) from ${WG_CONF_DIR} (originals in ${ADOPT_BACKUP})."
+  fi
+  return 0
+}
+
+adopt_clean_path() {
+  local d b found=0
+  pre_adopt_backup
+  for d in $SHADOW_BIN_DIRS_DEFAULT; do
+    [ -d "$d" ] || continue
+    for b in wg wg-quick awg awg-quick amneziawg-go; do
+      if [ -e "$d/$b" ]; then
+        move_to_backup "$d/$b" "bin-${b}"
+        found=$((found+1))
+        warn "Removed shadowing binary ${d}/${b} (was overriding /usr/bin/${b} via PATH order)."
+      fi
+    done
+  done
+  hash -r 2>/dev/null || true
+  if [ "$found" -gt 0 ]; then
+    ok "Moved ${found} shadowing binary(ies) to ${ADOPT_BACKUP}."
+  else
+    ok "No shadowing wg/awg binaries under /usr/local - nothing to do."
+  fi
+  return 0
+}
+
+run_adoption() {
+  hdr "Adoption scan (pre-existing installs)"
+  adoption_report
+  if [ "$ADOPT_FINDINGS" -gt 0 ] && [ -z "$OPT_ADOPT_DASH_FROM" ] \
+     && [ "$OPT_ADOPT_AWG_CONF" -eq 0 ] && [ "$OPT_ADOPT_CLEAN_PATH" -eq 0 ]; then
+    log "Nothing was changed in this section - re-run with the --adopt-* flags shown above to standardize."
+  fi
+  if [ -n "$OPT_ADOPT_DASH_FROM" ]; then
+    adopt_dashboard_from "$OPT_ADOPT_DASH_FROM"
+  fi
+  if [ "$OPT_ADOPT_AWG_CONF" -eq 1 ]; then
+    adopt_awg_configs
+  fi
+  if [ "$OPT_ADOPT_CLEAN_PATH" -eq 1 ]; then
+    adopt_clean_path
+  fi
+  return 0
+}
+# ------------------------------------------------------------------ end adoption
+
 install_dashboard() { # $1 = tag
   local tag="$1"
   hdr "WGDashboard ${tag}"
@@ -606,7 +931,8 @@ install_dashboard() { # $1 = tag
   if [ ! -d "$DASHBOARD_DIR/.git" ]; then
     if [ -d "$DASHBOARD_DIR" ]; then
       die "${DASHBOARD_DIR} exists but is not a git checkout managed by this script.
-Move it away (or remove it) and re-run."
+Adopt it with: awg-suite install --adopt-dashboard-from ${DASHBOARD_DIR}
+(or move the directory away and re-run)."
     fi
     log "Cloning ${REPO_DASHBOARD} (tag ${tag}) into ${DASHBOARD_DIR}..."
     mkdir -p "$(dirname "$DASHBOARD_DIR")"
@@ -625,6 +951,9 @@ Move it away (or remove it) and re-run."
     git -C "$DASHBOARD_DIR" fetch -q --depth 1 origin tag "$tag"
     git -C "$DASHBOARD_DIR" checkout -q "$tag"
   fi
+
+  # v1.0.4: restore data staged by --adopt-dashboard-from (db / ini / logs)
+  restore_adopted_dashboard_data
 
   # Pre-seed the dashboard ini (port / bind) only when it does not exist yet,
   # so user-made settings are never overwritten.
@@ -1040,6 +1369,8 @@ cmd_install() {
     log "Existing installation detected - this run will repair/upgrade in place."
   fi
 
+  run_adoption
+
   hdr "Installing dependencies (apt)"
   apt_update_retry
   ensure_packages "${BASE_PACKAGES[@]}"
@@ -1288,6 +1619,9 @@ cmd_status() {
   ls -1 /etc/wireguard/*.conf 2>/dev/null | sed 's/^/  WG  /' || printf '  (none in /etc/wireguard)\n'
   ls -1 /etc/amnezia/amneziawg/*.conf 2>/dev/null | sed 's/^/  AWG /' || printf '  (none in /etc/amnezia/amneziawg)\n'
 
+  printf '\nStandardization scan:\n'
+  adoption_report
+
   if have_systemd; then
     printf '\nServices:\n'
     systemctl --no-legend --plain list-units 'wg-quick@*' 'awg-quick@*' 'wgdashboard.service' 'awg-suite-update.timer' 2>/dev/null \
@@ -1335,6 +1669,21 @@ Options:
   --purge                uninstall: also delete configs, keys, dashboard data
   --yes, -y              assume yes everywhere
 
+Adoption options (standardize pre-existing installs):
+  --adopt-dashboard-from DIR
+                         adopt an existing WGDashboard checkout: relocate it
+                         to /opt/wgdashboard under wgdashboard.service, keeping
+                         its database (peers, logins, settings); the old copy
+                         and units are backed up first
+  --adopt-awg-configs    move AWG-style configs from /etc/wireguard to
+                         /etc/amnezia/amneziawg and run them via awg-quick@
+  --adopt-clean-path     remove wg/awg binaries under /usr/local that shadow
+                         the suite's /usr/bin versions
+
+  (Detection is automatic: 'install' and 'status' report anything that needs
+   adopting; nothing is moved without the flags above, and every move is
+   backed up to /var/backups/awg-suite/pre-adopt-<date>/ first.)
+
 Examples:
   curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash
   curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash -s -- --dashboard-port 8080
@@ -1360,7 +1709,7 @@ parse_args() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dashboard-port|--dashboard-bind|--wg-port|--awg-port|--awg-go-tag|--awg-tools-tag|--dashboard-tag|--go-version)
+      --dashboard-port|--dashboard-bind|--wg-port|--awg-port|--awg-go-tag|--awg-tools-tag|--dashboard-tag|--go-version|--adopt-dashboard-from)
         [ $# -ge 2 ] || die "Option $1 requires a value."
         case "$1" in
           --dashboard-port)  OPT_DASH_PORT="$2"; USER_DASH_PORT="$2" ;;
@@ -1371,6 +1720,7 @@ parse_args() {
           --awg-tools-tag)   OPT_AWG_TOOLS_TAG="$2" ;;
           --dashboard-tag)   OPT_DASHBOARD_TAG="$2" ;;
           --go-version)      OPT_GO_VERSION="$2" ;;
+          --adopt-dashboard-from) OPT_ADOPT_DASH_FROM="$2" ;;
         esac
         shift 2 ;;
       --no-seed)         OPT_SEED=0; shift ;;
@@ -1381,6 +1731,8 @@ parse_args() {
       --auto)            OPT_AUTO=1; shift ;;
       --purge)           OPT_PURGE=1; shift ;;
       --yes|-y)          OPT_YES=1; shift ;;
+      --adopt-awg-configs) OPT_ADOPT_AWG_CONF=1; shift ;;
+      --adopt-clean-path)  OPT_ADOPT_CLEAN_PATH=1; shift ;;
       --help|-h)         usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 1 ;;
     esac

@@ -38,6 +38,41 @@ sudo ./awg-suite-installer.sh uninstall   # remove the suite (keeps tunnel confi
 `sudo ./awg-suite-installer.sh help` lists all options (ports, version pins,
 `--no-dashboard`, `--purge`, ...).
 
+## Adopting existing servers
+
+Already have servers with WG/AWG/WGDashboard installed "by hand"? `install`
+and `status` automatically **scan** for anything that differs from the
+canonical layout and report it — without changing anything. Then migrate with
+the `--adopt-*` flags (every move is backed up to
+`/var/backups/awg-suite/pre-adopt-<date>/` first; nothing is deleted):
+
+```bash
+# 1. see what would be adopted (read-only)
+sudo awg-suite status
+
+# 2. adopt an existing WGDashboard checkout - its database (peers, logins,
+#    settings) moves with it; it gets relocated to /opt/wgdashboard and is
+#    served by wgdashboard.service
+sudo awg-suite install --adopt-dashboard-from /root/wgdashboard
+
+# 3. move AWG-style configs that live in /etc/wireguard to
+#    /etc/amnezia/amneziawg (run by awg-quick@ units)
+sudo awg-suite install --adopt-awg-configs
+
+# 4. remove old wg/awg binaries under /usr/local that shadow the suite's
+#    /usr/bin versions (PATH order makes them win - this bites silently)
+sudo awg-suite install --adopt-clean-path
+```
+
+After adoption, every server has the identical layout — binaries in
+`/usr/bin`, configs in `/etc/wireguard` + `/etc/amnezia/amneziawg`, dashboard
+in `/opt/wgdashboard`, the same systemd units and the same weekly
+auto-update. Existing VPN clients are unaffected: keys and ports are
+preserved, tunnels just restart for a few seconds during the move. The
+dashboard port/bind is standardized to the suite defaults (10086 / 0.0.0.0)
+during adoption — override with `--dashboard-port` / `--dashboard-bind` if
+you need to keep an old value.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it

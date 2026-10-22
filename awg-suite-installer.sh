@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -89,6 +89,16 @@ SCRIPT_VERSION="1.0.6"
 #            UDP port. After dashboard adoption, the login hints correctly
 #            point to the ORIGINAL credentials (restored database) instead
 #            of admin/admin; a state marker remembers the adoption.
+#   v1.0.7 - Update-safety after adoption: the dashboard dirty-tree check now
+#            ignores runtime settings files (src/certbot.ini is tracked
+#            upstream and is legitimately overwritten by adoption / the
+#            dashboard itself), so version switches are no longer blocked;
+#            those files are carried across tag switches. Adoption staging
+#            is retired after use - a leftover staging dir from an older run
+#            can never clobber the live dashboard database again. The
+#            adopted-credentials hint now also fires from the persistent
+#            state marker (adoptions performed by <= v1.0.5 are recognized
+#            retroactively).
 
 set -Eeuo pipefail
 
@@ -810,6 +820,10 @@ adopt_dashboard_from() { # $1 = existing WGDashboard checkout directory
       log "Staged for restore: ${item}"
     fi
   done
+  # v1.0.7: mark the staging as fresh so restore_adopted_dashboard_data()
+  # knows it may overwrite the checkout contents (leftover staging from a
+  # PREVIOUS run must never clobber the live database).
+  ADOPT_STAGE_FRESH=1
 
   # move the whole old checkout into the adoption backup
   move_to_backup "$dir" "$bname"
@@ -818,10 +832,25 @@ adopt_dashboard_from() { # $1 = existing WGDashboard checkout directory
   return 0
 }
 
-restore_adopted_dashboard_data() { # called by install_dashboard after clone/checkout
+restore_adopted_dashboard_data() { # called by install_dashboard before version checks
   local staging="${STATE_DIR}/adopt-dashboard-data" item ini old_port old_ip
   [ -d "$staging" ] || return 0
   [ -n "$(ls -A "$staging" 2>/dev/null)" ] || return 0
+  # v1.0.7: staging left over from a PREVIOUS run (adoption completed, data
+  # already restored back then) must never overwrite the live database,
+  # which has kept evolving since. Only data staged in THIS run
+  # (ADOPT_STAGE_FRESH, set by adopt_dashboard_from) is authoritative.
+  # Either way: remember the adoption (persistent marker, so servers adopted
+  # by older installer versions get correct credentials hints too) and
+  # retire the staging so no future run repeats this.
+  if [ "${ADOPT_STAGE_FRESH:-0}" -ne 1 ] && [ -e "${DASHBOARD_DIR}/src/db" ]; then
+    ADOPTED_DASH_RESTORED=1
+    touch "${STATE_DIR}/dashboard-adopted" 2>/dev/null || true
+    rm -rf "$staging"
+    ok "Previous dashboard adoption found - keeping the live database as is."
+    ok "Adopted database active - log in with your ORIGINAL credentials (not admin/admin)."
+    return 0
+  fi
   for item in db log certbot.ini wg-dashboard.ini; do
     if [ -e "$staging/$item" ]; then
       rm -rf "${DASHBOARD_DIR}/src/$item"
@@ -829,6 +858,7 @@ restore_adopted_dashboard_data() { # called by install_dashboard after clone/che
       ok "Restored adopted dashboard ${item}."
     fi
   done
+  rm -rf "$staging"
   # v1.0.6: remember the adoption so login hints point at the ORIGINAL
   # credentials (the restored database keeps the old accounts, not admin/admin)
   ADOPTED_DASH_RESTORED=1
@@ -990,6 +1020,7 @@ install_dashboard() { # $1 = tag
     warn "Python ${pyver} < 3.12 - dashboard tags newer than v4.2.x may not be supported."
   fi
 
+  local cloned_now=0
   if [ ! -d "$DASHBOARD_DIR/.git" ]; then
     if [ -d "$DASHBOARD_DIR" ]; then
       die "${DASHBOARD_DIR} exists but is not a git checkout managed by this script.
@@ -999,8 +1030,23 @@ Adopt it with: awg-suite install --adopt-dashboard-from ${DASHBOARD_DIR}
     log "Cloning ${REPO_DASHBOARD} (tag ${tag}) into ${DASHBOARD_DIR}..."
     mkdir -p "$(dirname "$DASHBOARD_DIR")"
     git clone -q --depth 1 --branch "$tag" "$REPO_DASHBOARD" "$DASHBOARD_DIR"
-  else
-    if [ -n "$(git -C "$DASHBOARD_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    cloned_now=1
+  fi
+
+  # v1.0.4: restore data staged by --adopt-dashboard-from (db / ini / logs).
+  # v1.0.7: runs BEFORE the version checks below, so adoption data always
+  # lands even when the checkout is dirty or already on the right tag (the
+  # early returns used to skip the restore entirely).
+  restore_adopted_dashboard_data
+
+  if [ "$cloned_now" -eq 0 ]; then
+    # v1.0.7: runtime settings files are excluded from the dirty check -
+    # src/certbot.ini is TRACKED upstream and is legitimately overwritten by
+    # adoption and by the dashboard itself (WGDashboard writes its settings
+    # there). Without the exclusion, every adopted server (and every server
+    # whose settings were changed via the UI) would refuse dashboard updates
+    # forever.
+    if [ -n "$(git -C "$DASHBOARD_DIR" status --porcelain --untracked-files=no -- . ':(exclude)src/certbot.ini' ':(exclude)src/wg-dashboard.ini' 2>/dev/null)" ]; then
       warn "${DASHBOARD_DIR} has local modifications - refusing to switch versions."
       warn "Commit/stash them (or remove the checkout) and re-run."
       return 0
@@ -1010,12 +1056,20 @@ Adopt it with: awg-suite install --adopt-dashboard-from ${DASHBOARD_DIR}
       return 0
     fi
     log "Updating existing checkout to ${tag}..."
+    # v1.0.7: carry the runtime settings files across the tag switch (they
+    # may be locally modified, which 'git checkout -f' would discard).
+    local rtdir rt
+    rtdir="$(mktemp -d)"
+    for rt in certbot.ini wg-dashboard.ini; do
+      if [ -e "$DASHBOARD_DIR/src/$rt" ]; then cp -a "$DASHBOARD_DIR/src/$rt" "$rtdir/"; fi
+    done
     git -C "$DASHBOARD_DIR" fetch -q --depth 1 origin tag "$tag"
-    git -C "$DASHBOARD_DIR" checkout -q "$tag"
+    git -C "$DASHBOARD_DIR" checkout -q -f "$tag"
+    for rt in certbot.ini wg-dashboard.ini; do
+      if [ -e "$rtdir/$rt" ]; then cp -a "$rtdir/$rt" "$DASHBOARD_DIR/src/$rt"; fi
+    done
+    rm -rf "$rtdir"
   fi
-
-  # v1.0.4: restore data staged by --adopt-dashboard-from (db / ini / logs)
-  restore_adopted_dashboard_data
 
   # Pre-seed the dashboard ini (port / bind) only when it does not exist yet,
   # so user-made settings are never overwritten.
@@ -1045,7 +1099,7 @@ EOF
   save_state
 
   ok "WGDashboard ${tag} installed in ${DASHBOARD_DIR}."
-  if [ "${ADOPTED_DASH_RESTORED:-0}" -eq 1 ]; then
+  if [ "${ADOPTED_DASH_RESTORED:-0}" -eq 1 ] || [ -f "${STATE_DIR}/dashboard-adopted" ]; then
     ok "Web UI: http://${PRIMARY_IP}:${OPT_DASH_PORT}  (database restored - use your ORIGINAL login)"
   else
     ok "Web UI: http://${PRIMARY_IP}:${OPT_DASH_PORT}  (default login: admin / admin - change it!)"
@@ -1264,7 +1318,7 @@ seed_tunnels() {
 
   if [ ! -f /etc/wireguard/wg0.conf ]; then
     if [ "$wg_starter_retired" -eq 1 ]; then
-      log "Not re-seeding wg0 - its subnet is already used by an existing tunnel."
+      log "Not re-seeding wg0 - its subnet or listen port is already used by an existing tunnel."
     elif [ -n "$(foreign_confs_in_dir /etc/wireguard wg0.conf)" ] && [ "$OPT_FORCE" -eq 0 ]; then
       log "Existing tunnel configs found in /etc/wireguard - not seeding a starter wg0"
       log "(this server already runs its own tunnels; --force seeds one anyway)."
@@ -1293,7 +1347,7 @@ EOF
 
   if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then
     if [ "$awg_starter_retired" -eq 1 ]; then
-      log "Not re-seeding awg0 - its subnet is already used by an existing tunnel."
+      log "Not re-seeding awg0 - its subnet or listen port is already used by an existing tunnel."
     elif [ -n "$(foreign_confs_in_dir /etc/amnezia/amneziawg awg0.conf)" ] && [ "$OPT_FORCE" -eq 0 ]; then
       log "Existing tunnel configs found in /etc/amnezia/amneziawg - not seeding a starter awg0"
       log "(this server already runs its own tunnels; --force seeds one anyway)."
@@ -1575,14 +1629,18 @@ print_banner() {
   fi
   printf '  Auto-update  : %s\n' "$([ "$OPT_AUTO_UPDATE" -eq 1 ] && have_systemd && echo 'weekly systemd timer' || echo 'manual (awg-suite update)')"
   printf '%s\n' "-------------------------------------------------------------------------"
+  local tunits=""
+  if [ -f /etc/wireguard/wg0.conf ]; then tunits="wg-quick@wg0"; fi
+  if [ -f /etc/amnezia/amneziawg/awg0.conf ]; then tunits="${tunits:+${tunits} }awg-quick@awg0"; fi
+  if [ -z "$tunits" ]; then tunits="'wg-quick@*' 'awg-quick@*'"; fi
   printf '  Next steps:\n'
-  if [ "${ADOPTED_DASH_RESTORED:-0}" -eq 1 ]; then
+  if [ "${ADOPTED_DASH_RESTORED:-0}" -eq 1 ] || [ -f "${STATE_DIR}/dashboard-adopted" ]; then
     printf '    * Open the dashboard and log in with your ORIGINAL credentials (adopted).\n'
   else
     printf '    * Open the dashboard, log in (admin/admin) and SET A NEW PASSWORD.\n'
   fi
   printf '    * Add peers/tunnels from the dashboard, or edit the seeded configs.\n'
-  printf '    * Tunnel services:  systemctl status wg-quick@wg0 awg-quick@awg0\n'
+  printf '    * Tunnel services:  systemctl status %s\n' "$tunits"
   printf '    * Suite management: awg-suite status | update | uninstall\n'
   printf '%s\n' "-------------------------------------------------------------------------"
   printf '  Component versions: amneziawg-go %s | amneziawg-tools %s | dashboard %s\n' \

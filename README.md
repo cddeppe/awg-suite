@@ -80,6 +80,11 @@ to brand-new installs. If a tunnel start ever fails with "Address already in
 use", the installer names the interface/process that holds the colliding
 subnet or UDP port.
 
+Dashboard updates stay unblocked after adoption: runtime settings files
+(`src/certbot.ini`, `src/wg-dashboard.ini`) are ignored by the dirty-tree
+check and carried across version switches, and adoption staging is retired
+after use — the live dashboard database is never overwritten by a stale copy.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it

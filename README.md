@@ -49,6 +49,8 @@ from this repo's `master` branch**. Missed runs catch up after downtime
 
 - Dashboard: `http://<server-ip>:10086` — default login `admin` / `admin` (change it!)
 - Starter configs: `/etc/wireguard/wg0.conf` (UDP 51820) and
-  `/etc/amnezia/amneziawg/awg0.conf` (UDP 42666) — existing files are never overwritten.
+  `/etc/amnezia/amneziawg/awg0.conf` (UDP 42666) — existing files are never overwritten
+  (re-running the installer does auto-repair seeds from older installer versions,
+  e.g. the invalid AWG `H1`–`H4` values written before v1.0.3).
 - `uninstall` keeps tunnel configs and backs up the dashboard DB to
   `/var/backups/awg-suite`; add `--purge` to remove everything.

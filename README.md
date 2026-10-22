@@ -1,9 +1,8 @@
-# AWG Suite Installer
+# awg-suite
 
 One script, one step: a complete **WireGuard + AmneziaWG + WGDashboard** stack on
-Ubuntu/Debian (amd64 & arm64) — with systemd services and automatic weekly updates.
-
-Everything is always built/fetched from **upstream**; this repo only hosts the installer.
+Ubuntu/Debian (amd64 & arm64) — systemd services, weekly auto-updates, always
+built from **upstream** sources.
 
 | Component | Tools | Default port | Source |
 |---|---|---|---|
@@ -14,12 +13,14 @@ Everything is always built/fetched from **upstream**; this repo only hosts the i
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cddeppe/amneziawg-go/master/awg-suite-installer.sh -o awg-suite-installer.sh
+curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh -o awg-suite-installer.sh
 chmod +x awg-suite-installer.sh
 sudo ./awg-suite-installer.sh install
 ```
 
 Requires Ubuntu 22.04+ / Debian 12+ (amd64 or arm64), root, and internet access.
+Everything — dependencies, Go toolchain, builds, services, starter configs — is
+handled automatically; re-running is safe (idempotent).
 
 ## Lifecycle
 

@@ -82,7 +82,7 @@ GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f4
 
 # Where the installed copy of this script refreshes itself from.
 # (Adjust if you host the script somewhere else.)
-SELF_UPDATE_URL="https://raw.githubusercontent.com/cddeppe/amneziawg-go/master/awg-suite-installer.sh"
+SELF_UPDATE_URL="https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh"
 
 STATE_DIR="/var/lib/awg-suite"
 LOG_DIR="/var/log/awg-suite"

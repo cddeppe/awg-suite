@@ -58,7 +58,18 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
+#
+# Changelog:
+#   v1.0.3 - AWG 3.x seed fix: H1-H4 are message-type ranges that must NOT
+#            overlap; v1.0.x seeds wrote the same value four times, which
+#            amneziawg-go rejects with EINVAL ("Unable to modify interface:
+#            Invalid argument"), so awg-quick@awg0 could never start.
+#            Existing v1.0.x seeds are migrated automatically on re-install.
+#          - WGDashboard dirty check now ignores untracked runtime files
+#            (venv/, db/, log/, __pycache__) - no more false-positive warning.
+#          - awg-quick failures that mention "Invalid argument" now print a
+#            hint about AWG 3.x obfuscation parameter rules.
 
 set -Eeuo pipefail
 
@@ -601,7 +612,7 @@ Move it away (or remove it) and re-run."
     mkdir -p "$(dirname "$DASHBOARD_DIR")"
     git clone -q --depth 1 --branch "$tag" "$REPO_DASHBOARD" "$DASHBOARD_DIR"
   else
-    if [ -n "$(git -C "$DASHBOARD_DIR" status --porcelain 2>/dev/null)" ]; then
+    if [ -n "$(git -C "$DASHBOARD_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
       warn "${DASHBOARD_DIR} has local modifications - refusing to switch versions."
       warn "Commit/stash them (or remove the checkout) and re-run."
       return 0
@@ -708,8 +719,26 @@ upgrade_seed_config() { # $1=file  $2=address  $3=wan_if (optional)
   local file="$1" address="$2" wan="$3"
   [ -f "$file" ] || return 0
   grep -q 'created by awg-suite-installer' "$file" 2>/dev/null || return 0
-  grep -q '^Address' "$file" 2>/dev/null && return 0
   grep -q '^\[Peer\]' "$file" 2>/dev/null && return 0
+
+  # v1.0.3 - repair overlapping AWG 3.x header ranges. amneziawg-go >= 3.x
+  # requires H1-H4 to be non-overlapping decimal ranges; seeds written by
+  # installer v1.0.0 - v1.0.2 used the same value four times, which the
+  # daemon rejects with EINVAL so awg-quick@awg0 never started.
+  local h1 h2 h3 h4
+  h1=$(sed -n 's/^H1 = \([0-9][0-9-]*\)$/\1/p' "$file")
+  h2=$(sed -n 's/^H2 = \([0-9][0-9-]*\)$/\1/p' "$file")
+  h3=$(sed -n 's/^H3 = \([0-9][0-9-]*\)$/\1/p' "$file")
+  h4=$(sed -n 's/^H4 = \([0-9][0-9-]*\)$/\1/p' "$file")
+  if [ -n "$h1" ] && [ "$h1" = "$h2" ] && [ "$h1" = "$h3" ] && [ "$h1" = "$h4" ]; then
+    sed -i -e 's|^H1 = .*$|H1 = 101-200|' \
+           -e 's|^H2 = .*$|H2 = 211-300|' \
+           -e 's|^H3 = .*$|H3 = 311-400|' \
+           -e 's|^H4 = .*$|H4 = 411-500|' "$file"
+    ok "Upgraded seed ${file}: replaced identical H1-H4 (${h1}) with non-overlapping AWG3 header ranges."
+  fi
+
+  grep -q '^Address' "$file" 2>/dev/null && return 0
   sed -i "s|^# Address = .*$|Address = ${address}|" "$file" 2>/dev/null || true
   if [ -n "$wan" ] && ! grep -q '^PostUp' "$file"; then
     printf 'PostUp = iptables -A FORWARD -i %%i -j ACCEPT; iptables -t nat -A POSTROUTING -o %s -j MASQUERADE\nPostDown = iptables -D FORWARD -i %%i -j ACCEPT; iptables -t nat -D POSTROUTING -o %s -j MASQUERADE\n' "$wan" "$wan" >> "$file"
@@ -764,7 +793,9 @@ EOF
     awg_priv=$(wg genkey)
     cat > /etc/amnezia/amneziawg/awg0.conf <<EOF
 # AmneziaWG server tunnel (created by awg-suite-installer)
-# Obfuscation parameters below are sane defaults - regenerate for your fleet.
+# AWG 3.x obfuscation params: Jc/Jmin/Jmax junk packets, S1/S2 handshake
+# padding, H1-H4 message-type ranges (must be non-overlapping, and every
+# peer that connects here must use the same H1-H4/S1/S2 values).
 [Interface]
 PrivateKey = ${awg_priv}
 ListenPort = ${OPT_AWG_PORT}
@@ -773,10 +804,10 @@ Jmin = 40
 Jmax = 70
 S1 = 76
 S2 = 86
-H1 = 1234567
-H2 = 1234567
-H3 = 1234567
-H4 = 1234567
+H1 = 101-200
+H2 = 211-300
+H3 = 311-400
+H4 = 411-500
 Address = 10.11.0.1/24
 ${nat_up}
 ${nat_down}
@@ -830,8 +861,19 @@ enable_tunnel_services() {
     else
       failed=1
       warn "${u} did NOT start - recent journal output follows:"
-      journalctl -u "${u}.service" -n 12 --no-pager 2>/dev/null | sed 's/^/    /' || true
+      local jl
+      jl="$(journalctl -u "${u}.service" -n 12 --no-pager 2>/dev/null || true)"
+      printf '%s\n' "$jl" | sed 's/^/    /'
       warn "Inspect with: journalctl -u ${u}.service -n 50 --no-pager"
+      case "$u" in
+        awg-quick@*)
+          if printf '%s\n' "$jl" | grep -q 'Invalid argument'; then
+            warn "Hint: 'Invalid argument' from awg setconf usually means bad AWG obfuscation"
+            warn "params. In AWG 3.x, H1-H4 must be NON-OVERLAPPING decimal ranges"
+            warn "(e.g. H1 = 101-200, H2 = 211-300, ...) matching on server and peers."
+          fi
+          ;;
+      esac
     fi
   done
   [ "$failed" -eq 0 ] && ok "All tunnel services active: ${units[*]}"
@@ -1072,7 +1114,7 @@ cmd_update() {
   if [ "$OPT_DASHBOARD" -eq 1 ] && [ -d "$DASHBOARD_DIR/.git" ]; then
     tag="$(dashboard_target_tag)"
     if [ "$tag" != "$DASHBOARD_TAG" ] || [ "$OPT_FORCE" -eq 1 ]; then
-      if [ -n "$(git -C "$DASHBOARD_DIR" status --porcelain 2>/dev/null)" ]; then
+      if [ -n "$(git -C "$DASHBOARD_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
         warn "${DASHBOARD_DIR} has local modifications - dashboard update skipped."
       else
         log "WGDashboard: ${DASHBOARD_TAG} -> ${tag}"

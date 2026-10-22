@@ -19,10 +19,11 @@
 #                        (older releases work with --no-dashboard)
 #
 #  Usage:
-#    sudo ./awg-suite-installer.sh install   [options]
+#    sudo ./awg-suite-installer.sh install   [options]   (default command)
 #    sudo ./awg-suite-installer.sh update    [options]
 #    sudo ./awg-suite-installer.sh uninstall [--purge] [--yes]
-#    sudo ./awg-suite-installer.sh status
+#    sudo ./awg-suite-installer.sh status    | help
+#    curl -fsSL <raw-url> | sudo bash        (one-step install, no command)
 #
 #  Install options:
 #    --dashboard-port N     WGDashboard HTTP port           (default 10086)
@@ -57,7 +58,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 set -Eeuo pipefail
 
@@ -181,14 +182,36 @@ ver_ge() { # ver_ge A B -> true if A >= B
 
 ver_lt() { ! ver_ge "$1" "$2"; }
 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-      log "Not running as root - re-executing through sudo..."
-      exec sudo -E bash "$0" "$@"
-    fi
-    die "This script must run as root (try: sudo $0 ${CMD})."
+# Resolve this script's own source file. Fails when running from stdin
+# (curl | sudo bash), where BASH_SOURCE[0] is "main" and no such file exists.
+script_source_file() {
+  local src="${BASH_SOURCE[0]:-}"
+  if [ -n "$src" ] && [ -f "$src" ] && grep -q '^AWG_SUITE_INSTALLER=1' "$src" 2>/dev/null; then
+    readlink -f "$src"
+    return 0
   fi
+  return 1
+}
+
+require_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    return 0
+  fi
+  if ! script_source_file >/dev/null 2>&1; then
+    die "This script is being piped and must run as root:
+
+    curl -fsSL ${SELF_UPDATE_URL} | sudo bash
+
+or download it first and run:
+
+    curl -fsSL ${SELF_UPDATE_URL} -o awg-suite-installer.sh
+    sudo ./awg-suite-installer.sh install"
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    log "Not running as root - re-executing through sudo..."
+    exec sudo -E bash "$0" "$@"
+  fi
+  die "This script must run as root (try: sudo $0 ${CMD})."
 }
 
 acquire_lock() {
@@ -847,12 +870,29 @@ self_update() {
 }
 
 install_self() {
-  if [ "$(readlink -f "${BASH_SOURCE[0]}")" != "$SCRIPT_INSTALL_PATH" ]; then
-    install -m 0755 "${BASH_SOURCE[0]}" "$SCRIPT_INSTALL_PATH"
+  local src
+  if src=$(script_source_file); then
+    if [ "$src" != "$SCRIPT_INSTALL_PATH" ]; then
+      install -m 0755 "$src" "$SCRIPT_INSTALL_PATH"
+      ok "Installed script as ${SCRIPT_INSTALL_PATH} (shortcut: awg-suite)."
+    fi
+    ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_SYMLINK"
+  else
+    # Running from a pipe (curl | sudo bash): fetch the canonical copy from
+    # the repo so the installed script has a real file on disk.
+    local tmp="${TMPDIR_AWG}/installer-from-repo.sh"
+    log "Running from stdin - fetching installer from ${SELF_UPDATE_URL}..."
+    if ! curl -fsSL --retry 2 --connect-timeout 15 -o "$tmp" "$SELF_UPDATE_URL" \
+      || ! bash -n "$tmp" 2>/dev/null \
+      || ! grep -q '^AWG_SUITE_INSTALLER=1' "$tmp"; then
+      die "Could not fetch a valid installer from ${SELF_UPDATE_URL}.
+Download it manually and re-run:
+    curl -fsSL ${SELF_UPDATE_URL} -o awg-suite-installer.sh
+    sudo ./awg-suite-installer.sh install"
+    fi
+    install -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
     ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_SYMLINK"
     ok "Installed script as ${SCRIPT_INSTALL_PATH} (shortcut: awg-suite)."
-  else
-    ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_SYMLINK"
   fi
 }
 
@@ -1155,17 +1195,60 @@ cmd_status() {
 }
 
 usage() {
-  sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+awg-suite-installer.sh - WireGuard + AmneziaWG + WGDashboard in one step
+
+Usage:
+  awg-suite-installer.sh [command] [options]
+  curl -fsSL <url> | sudo bash        # one-step install (command optional)
+
+Commands:
+  install      Install / repair / upgrade the full suite (default)
+  update       Update all components and the script itself
+  uninstall    Remove services and binaries (configs kept unless --purge)
+  status       Show versions, services and the next auto-update
+  help         Show this help
+
+Options:
+  --dashboard-port N     WGDashboard HTTP port            (default 10086)
+  --dashboard-bind IP    WGDashboard bind address         (default 0.0.0.0)
+  --wg-port N            seeded WireGuard listen port     (default 51820)
+  --awg-port N           seeded AmneziaWG listen port     (default 42666)
+  --no-seed              do not create starter wg0/awg0 tunnel configs
+  --no-dashboard         skip WGDashboard (lifts the OS version floor)
+  --no-auto-update       do not install the weekly auto-update timer
+  --awg-go-tag TAG       pin amneziawg-go to an upstream tag
+  --awg-tools-tag TAG    pin amneziawg-tools to an upstream tag
+  --dashboard-tag TAG    pin WGDashboard to an upstream tag
+  --go-version V         use a specific Go toolchain version
+  --force                rebuild/reinstall even when up to date
+  --auto                 non-interactive mode (systemd timer / CI)
+  --no-self-update       do not refresh the installed script itself
+  --purge                uninstall: also delete configs, keys, dashboard data
+  --yes, -y              assume yes everywhere
+
+Examples:
+  curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash
+  curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash -s -- --dashboard-port 8080
+  sudo awg-suite update
+  sudo awg-suite uninstall --purge
+EOF
 }
 
 # ------------------------------------------------------------------ arg parsing
 parse_args() {
-  [ $# -ge 1 ] || { usage; exit 1; }
-  CMD="$1"; shift
-  case "$CMD" in
-    install|update|uninstall|status|help|--help|-h) ;;
-    *) err "Unknown command: ${CMD}"; usage; exit 1 ;;
-  esac
+  if [ $# -ge 1 ]; then
+    case "$1" in
+      install|update|uninstall|status|help|--help|-h)
+        CMD="$1"; shift ;;
+      -*)
+        CMD="install" ;;  # options without a command default to install
+      *)
+        err "Unknown command: $1"; usage; exit 1 ;;
+    esac
+  else
+    CMD="install"  # bare invocation (curl | sudo bash) defaults to install
+  fi
 
   while [ $# -gt 0 ]; do
     case "$1" in

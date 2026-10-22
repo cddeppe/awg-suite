@@ -13,9 +13,14 @@ built from **upstream** sources.
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh -o awg-suite-installer.sh
-chmod +x awg-suite-installer.sh
-sudo ./awg-suite-installer.sh install
+curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash
+```
+
+No command needed — a bare piped invocation installs. To pass options through
+the pipe, use `bash -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cddeppe/awg-suite/master/awg-suite-installer.sh | sudo bash -s -- --dashboard-port 8080
 ```
 
 Requires Ubuntu 22.04+ / Debian 12+ (amd64 or arm64), root, and internet access.

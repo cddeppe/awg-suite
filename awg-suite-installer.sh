@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -99,6 +99,18 @@ SCRIPT_VERSION="1.0.7"
 #            adopted-credentials hint now also fires from the persistent
 #            state marker (adoptions performed by <= v1.0.5 are recognized
 #            retroactively).
+#   v1.0.8 - Userspace-compat repair for adopted AWG configs: when the
+#            amneziawg kernel module is absent (this suite's normal mode -
+#            awg-quick falls back to amneziawg-go), install/update now
+#            rewrites classic kernel-module-era configs the userspace stack
+#            refuses to load: per-peer "AdvancedSecurity" lines are removed
+#            (the userspace awg tool aborts with EINVAL when the key is
+#            present, whether it reads "on" or "off"), missing/overlapping
+#            H1-H4 are repaired (legal values kept verbatim, missing slots
+#            get the wire-compatible singleton H<n>=n) and S>65535 is
+#            clamped. Timestamped backups next to each file, repaired
+#            tunnels restart, and a warning names the H values whose client
+#            configs must be updated to match.
 
 set -Eeuo pipefail
 
@@ -1387,6 +1399,189 @@ EOF
   save_state
 }
 
+# ------------------------------------------------------------------ awg userspace compat (v1.0.8)
+# Configs written for the classic (kernel-module) AmneziaWG are rejected by
+# the userspace stack this suite runs (awg-quick falls back to amneziawg-go
+# whenever /sys/module/amneziawg is absent):
+#   * the userspace path of the awg tool aborts with EINVAL when ANY [Peer]
+#     carries an "AdvancedSecurity" line - "on" and "off" alike; only the
+#     kernel-module path supports that per-peer flag,
+#   * the daemon rejects the whole config when H1-H4 are missing or
+#     overlapping ("headers must not overlap"); the classic module silently
+#     defaulted them (v1.0.3 repaired this for suite-seeded configs only).
+# Repair policy - keep every legal value verbatim:
+#   * Jc/Jmin/Jmax/I*/R* are never touched; S>65535 is clamped (uint16),
+#   * legal, non-overlapping H values are kept exactly as they are,
+#   * missing H slots are filled with the wire-compatible singleton H<n>=n
+#     (the real WireGuard message type - identical bytes on the wire, so
+#     clients written without H keep working),
+#   * only present-but-illegal H values (duplicate/overlapping/oversized)
+#     get a fresh disjoint range (a reversed range is swapped, not replaced),
+#   * per-peer AdvancedSecurity lines are deleted (no userspace meaning).
+# Each modified file is backed up next to itself as <name>.conf.bak-<ts>.
+# The whole pass is skipped while the amneziawg kernel module is loaded -
+# the kernel path accepts everything repaired here.
+
+_awg_h_disjoint() { # $1=lo $2=hi ; uses f_lo/f_hi from the calling scope
+  local i
+  for i in 1 2 3 4; do
+    [ -n "${f_lo[$i]:-}" ] || continue
+    if (( $1 <= ${f_hi[$i]} && ${f_lo[$i]} <= $2 )); then return 1; fi
+  done
+  return 0
+}
+
+awg_get_h() { # $1 = 1..4, $2 = file -> "lo[-hi]" (first occurrence)
+  sed -n "s/^[[:space:]]*H$1[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)\(-[0-9][0-9]*\)\{0,1\}[[:space:]]*$/\1\2/p" "$2" | head -n1
+}
+
+awg_userspace_repair_file() { # $1 = config file ; rc 0 = file was repaired
+  local F="$1"
+  [ -f "$F" ] || return 1
+
+  # per-peer AdvancedSecurity lines (any value) break the userspace awg path
+  local adv_count
+  adv_count=$(grep -cE '^[[:space:]]*AdvancedSecurity[[:space:]]*=' "$F" || true)
+
+  local n v lo hi t
+  local cur_lo=() cur_hi=()
+  for n in 1 2 3 4; do
+    v=$(awg_get_h "$n" "$F"); lo=""; hi=""
+    case "$v" in
+      *-*) lo=${v%-*}; hi=${v#*-} ;;
+      "")  ;;
+      *)   lo=$v; hi=$v ;;
+    esac
+    # a reversed range is rejected by the daemon; swapping keeps the numbers
+    if [ -n "$lo" ] && [ "$lo" -gt "$hi" ] 2>/dev/null; then t=$lo; lo=$hi; hi=$t; fi
+    cur_lo[$n]=$lo; cur_hi[$n]=$hi
+  done
+
+  local f_lo=() f_hi=()
+  local MAX32=4294967295 changed=() filled=()
+  for n in 1 2 3 4; do
+    lo=${cur_lo[$n]}; hi=${cur_hi[$n]}
+    if [ -n "$lo" ] && [ "$lo" -le "$hi" ] && [ "$hi" -le "$MAX32" ] \
+       && _awg_h_disjoint "$lo" "$hi"; then
+      f_lo[$n]=$lo; f_hi[$n]=$hi                # legal - keep verbatim
+      continue
+    fi
+    local pick=""
+    if [ -z "$lo" ]; then
+      if _awg_h_disjoint "$n" "$n"; then        # missing - wire-compatible
+        pick="$n $n"; filled+=("H$n")
+      fi
+    fi
+    if [ -z "$pick" ]; then                     # illegal - fresh small range
+      local k=0 clo chi
+      while [ $k -lt 20000 ]; do
+        clo=$((101 + k*110)); chi=$((clo+99))
+        if _awg_h_disjoint "$clo" "$chi"; then pick="$clo $chi"; break; fi
+        k=$((k+1))
+      done
+    fi
+    [ -n "$pick" ] || { warn "Could not find a free H range for ${F} - file left untouched."; return 1; }
+    read f_lo[$n] f_hi[$n] <<< "$pick"
+    changed+=("H$n")
+  done
+
+  # S values above uint16 can never load - clamp
+  local s_clamped=0
+  if grep -qE '^[[:space:]]*S[1-4][[:space:]]*=[[:space:]]*[0-9]{6,}' "$F"; then
+    s_clamped=1
+  fi
+
+  local h_lines
+  h_lines=$(grep -cE '^[[:space:]]*H[1-4][[:space:]]*=' "$F" || true)
+
+  local need_rewrite=0
+  if [ "$adv_count" -gt 0 ] || [ ${#changed[@]} -gt 0 ] || [ ${#filled[@]} -gt 0 ] \
+     || [ "$s_clamped" -eq 1 ] || [ "$h_lines" -gt 4 ]; then
+    need_rewrite=1
+  fi
+  [ "$need_rewrite" -eq 1 ] || return 1         # already userspace-compatible
+
+  local vals=()
+  for n in 1 2 3 4; do
+    if [ "${f_lo[$n]}" = "${f_hi[$n]}" ]; then vals[$n]="H$n = ${f_lo[$n]}"; else vals[$n]="H$n = ${f_lo[$n]}-${f_hi[$n]}"; fi
+  done
+  local BAK="${F}.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$F" "$BAK"
+  awk -v h1="${vals[1]}" -v h2="${vals[2]}" -v h3="${vals[3]}" -v h4="${vals[4]}" '
+    /^[[:space:]]*(AdvancedSecurity|H[1-4])[[:space:]]*=/ { next }
+    { print }
+    /^\[Interface\]/ && !ins { print h1; print h2; print h3; print h4; ins=1 }
+  ' "$F" > "${F}.new" || { rm -f "${F}.new"; warn "Rewriting ${F} failed - left untouched."; return 1; }
+  if ! grep -q '^H1 = ' "${F}.new"; then
+    rm -f "${F}.new"
+    warn "No [Interface] section in ${F} - left untouched (nowhere to place H1-H4)."
+    return 1
+  fi
+  if [ "$s_clamped" -eq 1 ]; then
+    sed -i -E 's/^([[:space:]]*S[1-4][[:space:]]*=[[:space:]]*)[0-9]{6,}[[:space:]]*$/\165535/' "${F}.new"
+  fi
+  cat "${F}.new" > "$F" && rm -f "${F}.new"
+  chmod 600 "$F"
+
+  local what=""
+  if [ "$adv_count" -gt 0 ]; then
+    what="removed ${adv_count} per-peer AdvancedSecurity line(s) (the userspace awg rejects the key whether it reads on or off)"
+  fi
+  local n2 what_h=""
+  for n2 in 1 2 3 4; do
+    local was now
+    if [ -n "${cur_lo[$n2]}" ]; then
+      if [ "${cur_lo[$n2]}" = "${cur_hi[$n2]}" ]; then was="${cur_lo[$n2]}"; else was="${cur_lo[$n2]}-${cur_hi[$n2]}"; fi
+    else
+      was="missing"
+    fi
+    if [ "${f_lo[$n2]}" = "${f_hi[$n2]}" ]; then now="${f_lo[$n2]}"; else now="${f_lo[$n2]}-${f_hi[$n2]}"; fi
+    what_h="${what_h}H${n2}: ${was} -> ${now}  "
+  done
+  if [ -n "$what" ]; then what="${what}; "; fi
+  what="${what}H1-H4 now: ${what_h}"
+  if [ "$s_clamped" -eq 1 ]; then what="${what}; clamped S>65535 to 65535"; fi
+  ok "Repaired ${F} for userspace AmneziaWG: ${what}(backup: ${BAK})"
+  if [ ${#changed[@]} -gt 0 ]; then
+    warn "Obfuscation values changed for ${changed[*]} - every client of this tunnel must use the same H1-H4."
+  fi
+  REPAIRED_AWG_IFACES="${REPAIRED_AWG_IFACES:-} $(basename "$F" .conf)"
+  return 0
+}
+
+repair_awg_userspace_compat() {
+  # v1.0.8: keep every AWG config loadable by the userspace stack. Skipped
+  # entirely while the amneziawg kernel module is loaded (the kernel path
+  # accepts everything repaired here); no-op for already-compatible configs.
+  REPAIRED_AWG_IFACES=""
+  if [ -d /sys/module/amneziawg ]; then
+    log "amneziawg kernel module is loaded - userspace-compat repair not needed."
+    return 0
+  fi
+  local f any=0
+  for f in /etc/amnezia/amneziawg/*.conf; do
+    [ -f "$f" ] || continue
+    if awg_userspace_repair_file "$f"; then any=1; fi
+  done
+  if [ "$any" -eq 0 ]; then
+    log "All AmneziaWG configs are userspace-compatible."
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    local u
+    for u in $REPAIRED_AWG_IFACES; do
+      if systemctl is-enabled --quiet "awg-quick@${u}.service" >/dev/null 2>&1; then
+        if sysdo restart "awg-quick@${u}.service"; then
+          ok "Restarted awg-quick@${u} with the repaired config."
+        else
+          warn "Could not restart awg-quick@${u} - check: systemctl status awg-quick@${u}"
+        fi
+      fi
+    done
+  fi
+}
+# ------------------------------------------------------------------ end awg userspace compat
+
 enable_tunnel_services() {
   hdr "Enabling tunnel services"
   if ! have_systemd; then
@@ -1678,6 +1873,7 @@ cmd_install() {
   fi
 
   seed_tunnels
+  repair_awg_userspace_compat
   enable_tunnel_services
   configure_sysctl
   configure_firewall
@@ -1748,6 +1944,11 @@ cmd_update() {
       ok "WGDashboard ${DASHBOARD_TAG} is up to date."
     fi
   fi
+
+  # v1.0.8: keep AWG configs loadable by the userspace stack (classic
+  # kernel-module configs: per-peer AdvancedSecurity lines, missing or
+  # overlapping H1-H4)
+  repair_awg_userspace_compat
 
   # ---- restart affected running services ----
   if have_systemd; then

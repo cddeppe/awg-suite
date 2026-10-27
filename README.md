@@ -85,6 +85,26 @@ Dashboard updates stay unblocked after adoption: runtime settings files
 check and carried across version switches, and adoption staging is retired
 after use — the live dashboard database is never overwritten by a stale copy.
 
+**Userspace compatibility (v1.0.8).** Configs written for the classic
+kernel-module AmneziaWG are not loadable by the userspace stack this suite
+runs (awg-quick falls back to `amneziawg-go` whenever the amneziawg kernel
+module is absent — the module's DKMS package does not build on current
+kernels and should be removed). `install` and `update` now repair such
+configs automatically, keeping every legal value verbatim:
+
+- per-peer `AdvancedSecurity` lines are removed — the userspace `awg` tool
+  refuses the whole config with `Invalid argument` when the key is present,
+  **whether it reads `on` or `off`** (only the kernel-module path supports
+  the per-peer flag);
+- missing or overlapping `H1`–`H4` are fixed (legal values kept as-is;
+  missing slots get the wire-compatible singleton `H<n>=<n>`), and `S>65535`
+  is clamped.
+
+Each modified file is backed up next to itself
+(`<name>.conf.bak-<timestamp>`), repaired tunnels restart, and the log names
+any `H` values that changed — client configs must use the same `H1`–`H4`.
+The pass is skipped while the amneziawg kernel module is loaded.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it

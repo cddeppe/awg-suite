@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.13"
+SCRIPT_VERSION="1.0.14"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -169,6 +169,15 @@ SCRIPT_VERSION="1.0.13"
 #            --state=active, and 'update' reconciles leftovers: when the
 #            module is loaded while amneziawg-go daemons still hold
 #            tunnels, they are restarted onto the kernel path.
+#   v1.0.14 - The reconciliation now also fires in cmd_update's
+#            "kernel module is up to date" branch: v1.0.13 had put it only
+#            inside install_awg_kernel_module's early return, but update
+#            short-circuits WITHOUT calling that function when the state
+#            tag already matches - so a box left on userspace by an older
+#            installer (module built + state saved, tunnels never switched)
+#            printed "up to date" and never healed. Reconciliation is a
+#            shared wrapper called from both places; the weekly auto-update
+#            timer now also self-heals such boxes.
 
 set -Eeuo pipefail
 
@@ -777,6 +786,19 @@ kmod_restart_tunnels_onto_module() {
   fi
 }
 
+# Switch live tunnels onto the (already loaded) kernel module when userspace
+# daemons still hold them. v1.0.13 buried this inside install_awg_kernel_module's
+# early return, but cmd_update short-circuits ("... is up to date.") WITHOUT
+# calling that function when the state tag matches - so boxes left on userspace
+# by older installers never healed. Shared wrapper, called from BOTH places.
+kmod_reconcile_userspace_tunnels() {
+  [ -d "$AWG_SYS_MODULE_PATH" ] || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  pgrep -x amneziawg-go >/dev/null 2>&1 || return 0
+  log "amneziawg-go still holds tunnel(s) although the kernel module is loaded - switching them."
+  kmod_restart_tunnels_onto_module
+}
+
 install_awg_kernel_module() { # $1 = tag
   local tag="$1"
   hdr "AmneziaWG kernel module (DKMS, optional): ${tag}"
@@ -791,11 +813,7 @@ install_awg_kernel_module() { # $1 = tag
     ok "amneziawg kernel module ${tag} already installed - nothing to do."
     # Reconcile leftovers from older installers: the module is installed and
     # loaded, but userspace daemons still hold live tunnels - switch them now.
-    if [ -d "$AWG_SYS_MODULE_PATH" ] && command -v pgrep >/dev/null 2>&1 \
-       && pgrep -x amneziawg-go >/dev/null 2>&1; then
-      log "amneziawg-go still holds tunnel(s) although the kernel module is loaded - switching them."
-      kmod_restart_tunnels_onto_module
-    fi
+    kmod_reconcile_userspace_tunnels
     return 0
   fi
 
@@ -2193,6 +2211,9 @@ cmd_update() {
       install_awg_kernel_module "$tag"
     else
       ok "amneziawg kernel module ${KERNEL_MODULE_TAG} is up to date."
+      # v1.0.14: this branch used to skip everything - heal boxes that an
+      # older installer left with tunnels on the userspace backend.
+      kmod_reconcile_userspace_tunnels
     fi
   fi
 

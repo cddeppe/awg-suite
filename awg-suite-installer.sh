@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.14"
+SCRIPT_VERSION="1.0.15"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -178,6 +178,14 @@ SCRIPT_VERSION="1.0.14"
 #            printed "up to date" and never healed. Reconciliation is a
 #            shared wrapper called from both places; the weekly auto-update
 #            timer now also self-heals such boxes.
+#   v1.0.15 - No more crying wolf after a successful switch: the old
+#            userspace daemons can take a second or two to exit after the
+#            unit restart, but the residual-daemon check ran immediately
+#            and warned "amneziawg-go is still running ... restart those
+#            units" on boxes where the switch had in fact succeeded (fleet
+#            rollout: the warning appeared and the daemon was gone moments
+#            later). The check now grants a grace period
+#            (KMOD_SWITCH_WAIT_SECONDS, default 5) before warning.
 
 set -Eeuo pipefail
 
@@ -774,14 +782,25 @@ kmod_neutralize_stale_udp_tunnel_macros() { # $1 = flattened module source dir
 # restarted anything, leaving amneziawg-go holding the tunnels after a
 # successful module install - caught on the first real-world run).
 kmod_restart_tunnels_onto_module() {
-  local awg_units
+  local awg_units i
   awg_units=$(systemctl list-units --type=service --state=active --plain --no-legend 'awg-quick@*' 2>/dev/null | awk '{print $1}')
   [ -n "$awg_units" ] || return 0
   # shellcheck disable=SC2086
   sysdo restart $awg_units \
     && ok "Restarted onto the kernel module: ${awg_units//$'\n'/ }" \
     || warn "Could not restart tunnels - they switch to the module on their next restart."
-  if command -v pgrep >/dev/null 2>&1 && pgrep -x amneziawg-go >/dev/null 2>&1; then
+  command -v pgrep >/dev/null 2>&1 || return 0
+  # The old userspace daemons can take a moment to die after the unit
+  # restart; grant them a grace period before warning (v1.0.11..1.0.14
+  # warned immediately and cried wolf on boxes where the switch had in
+  # fact succeeded - caught during the fleet rollout).
+  i=0
+  while [ "$i" -lt "${KMOD_SWITCH_WAIT_SECONDS:-5}" ] \
+        && pgrep -x amneziawg-go >/dev/null 2>&1; do
+    sleep 1
+    i=$((i + 1))
+  done
+  if pgrep -x amneziawg-go >/dev/null 2>&1; then
     warn "amneziawg-go is still running for some tunnel(s) - restart those units to switch them."
   fi
 }

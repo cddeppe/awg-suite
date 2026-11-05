@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.9"
+SCRIPT_VERSION="1.0.10"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -122,6 +122,15 @@ SCRIPT_VERSION="1.0.9"
 #            After a self-update the installer now re-execs the updated
 #            script immediately, so the new logic applies to the very run
 #            that downloaded it.
+#   v1.0.10 - Self-update re-exec lock fix: the v1.0.9 re-exec aborted
+#            with "Another instance of the installer is already running"
+#            because the flock fd survives exec and is inherited by the
+#            log-tee child processes. The lock is now explicitly released
+#            before the re-exec, the tee no longer inherits the lock fd,
+#            and acquire_lock waits up to 15s (LOCK_WAIT_SECONDS) instead
+#            of aborting instantly - which also self-heals the one-time
+#            v1.0.9 -> v1.0.10 transition, where the still-running v1.0.9
+#            image cannot release the lock itself.
 
 set -Eeuo pipefail
 
@@ -295,7 +304,11 @@ or download it first and run:
 acquire_lock() {
   mkdir -p "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
+  # v1.0.10: wait briefly instead of aborting instantly. Right after a
+  # self-update re-exec the previous image's log-tee may still hold the
+  # old lock file description for a few milliseconds; a genuine concurrent
+  # instance still aborts when the timeout expires.
+  if ! flock -w "${LOCK_WAIT_SECONDS:-15}" 9; then
     die "Another instance of the installer is already running."
   fi
 }
@@ -308,7 +321,9 @@ setup_logging() {
   if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE")" -gt 1048576 ]; then
     mv -f "$LOG_FILE" "${LOG_FILE}.old"
   fi
-  exec > >(tee -a "$LOG_FILE") 2>&1
+  # v1.0.10: 9>&- keeps the lock fd out of the tee child (it would survive
+  # exec and hold the flock in the background).
+  exec > >(tee -a "$LOG_FILE" 9>&-) 2>&1
   if [ "${OPT_AUTO:-0}" -eq 1 ]; then
     log "awg-suite-installer v${SCRIPT_VERSION} - command: ${CMD} (auto/timer mode)"
   else
@@ -1814,6 +1829,12 @@ self_update() {
   # SCRIPT_ARGS is always set by main() before update runs; the
   # ${arr[@]+"${arr[@]}"} idiom forwards zero-or-more args safely.
   log "Re-executing updated installer: ${SCRIPT_ARGS[*]:-<install>}"
+  # v1.0.10: release the instance lock BEFORE the re-exec. The lock fd
+  # survives exec and is also inherited by the log-tee children, so the
+  # fresh image would otherwise abort with "Another instance is already
+  # running" (exactly the v1.0.9 failure).
+  flock -u 9 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
   # shellcheck disable=SC2068
   exec bash "$SCRIPT_INSTALL_PATH" ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}
 }

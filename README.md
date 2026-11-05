@@ -113,6 +113,10 @@ takes the deb-owned `awg`/`awg-quick` with it, leaving
 `awg-quick: command not found` even though the state file says the tools are
 installed). After a self-update the installer also re-runs the freshly
 downloaded script immediately, so the new logic applies to the same run.
+(v1.0.10 fixed a follow-up bug: the re-run aborted with
+"Another instance of the installer is already running" because the lock
+file descriptor survived the re-exec — the lock is now released before it,
+and a second instance waits up to 15 s instead of failing instantly.)
 
 ## Automatic updates
 

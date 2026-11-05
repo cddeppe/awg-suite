@@ -135,6 +135,16 @@ headers are not yet installed). `dkms.conf`'s `AUTOINSTALL=yes` builds the
 module for new kernels automatically. `update` keeps the module current with
 its upstream tag; `uninstall` removes it cleanly.
 
+On kernels 6.13–7.1.4 the installer applies a small compat fix to the module
+sources before building: upstream's compat gate rewrites both `udp_tunnel`
+call sites, but in that window `setup_udp_tunnel_sock()` already takes a
+`struct sock *` while `udp_tunnel_sock_release()` still takes a
+`struct socket *` — the stale `setup_udp_tunnel_sock` rewrite is a fatal type
+error under modern gcc (seen on Ubuntu 26.04 / kernel 7.0). The fix is
+detection-driven: the kernel's own `udp_tunnel.h` is read and only the
+macro(s) contradicting the real signature are neutralized, so it becomes a
+silent no-op on old kernels, on 7.1.5+ and once upstream fixes the gate.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it

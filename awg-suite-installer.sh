@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.11"
+SCRIPT_VERSION="1.0.12"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -144,6 +144,19 @@ SCRIPT_VERSION="1.0.11"
 #            removes it cleanly. Also fixes adopt_clean_path creating an
 #            EMPTY pre-adopt-<timestamp> backup directory on every re-run
 #            on an already-clean box (backup creation is now lazy).
+#   v1.0.12 - Kernel-module build fix for kernels 6.13..7.1.4 (Ubuntu
+#            26.04 on the 7.0 oracle kernel hit it): upstream's single
+#            compat gate (< 7.1.5) rewrites BOTH udp_tunnel call sites,
+#            but in that window setup_udp_tunnel_sock() already takes a
+#            struct sock * while udp_tunnel_sock_release() still takes a
+#            struct socket * - the setup rewrite turns a type-correct
+#            call into a fatal -Wincompatible-pointer-types error under
+#            gcc >= 14. Before 'dkms add' the installer now reads the
+#            kernel's own udp_tunnel.h and neutralizes only the macro(s)
+#            whose rewrite contradicts the real signature. Detection-
+#            driven: old kernels, 7.1.5+ and a fixed upstream tag all
+#            make the pass a silent no-op. Userspace fallback on build
+#            failure remains.
 
 set -Eeuo pipefail
 
@@ -172,6 +185,8 @@ AWG_KMOD_FALLBACK_TAG="v3.1.20260906"
 # Overridable paths (tests point them at fixtures)
 KMOD_SRC_ROOT="${KMOD_SRC_ROOT:-/usr/src}"
 AWG_SYS_MODULE_PATH="${AWG_SYS_MODULE_PATH:-/sys/module/amneziawg}"
+# Kernel build tree whose udp_tunnel.h the compat fix inspects
+KMOD_KERNEL_BUILD="${KMOD_KERNEL_BUILD:-/lib/modules/$(uname -r)/build}"
 DASHBOARD_FALLBACK_TAG_PY312="v4.3.3"    # needs python >= 3.12, has AWG support
 DASHBOARD_FALLBACK_TAG_PY310="v4.2.5"    # python 3.10 / 3.11
 
@@ -698,6 +713,39 @@ install_awg_tools() { # $1 = tag
 # Optional DKMS kernel module: faster than the userspace amneziawg-go
 # backend. Opt-in (--kernel-module) or automatic once installed (state).
 # Failure-safe by design: any problem leaves the tunnels on userspace.
+
+# Kernels 6.13..7.1.4 (e.g. Ubuntu 26.04's 7.0 oracle kernel): the kernel's
+# setup_udp_tunnel_sock() already takes a struct sock * while
+# udp_tunnel_sock_release() still takes a struct socket *. Upstream's single
+# compat gate (< 7.1.5) rewrites BOTH call sites; the setup rewrite turns a
+# type-correct call into a -Wincompatible-pointer-types error, fatal under
+# gcc >= 14. Read the kernel's own udp_tunnel.h and neutralize only the
+# macro(s) whose rewrite contradicts the real signature - the release macro
+# survives whenever it is still correct. Detection-driven: old kernels
+# (both APIs take struct socket *), 7.1.5+ (the version gate closes) and a
+# future fixed upstream tag all make this a silent no-op.
+kmod_neutralize_stale_udp_tunnel_macros() { # $1 = flattened module source dir
+  local compat="${1}/compat/compat.h" hdr oneline patched=""
+  [ -f "$compat" ] || return 0
+  hdr="${KMOD_KERNEL_BUILD:-}/include/net/udp_tunnel.h"
+  [ -f "$hdr" ] || return 0
+  oneline=$(tr '\n' ' ' < "$hdr")
+  if grep -q '^#define setup_udp_tunnel_sock(' "$compat" \
+     && printf '%s\n' "$oneline" | grep -q 'setup_udp_tunnel_sock *([^)]*struct sock \*'; then
+    sed -i 's/^#define setup_udp_tunnel_sock(/#define awg_kmod_neutered_setup_udp_tunnel_sock(/' "$compat"
+    patched="setup_udp_tunnel_sock"
+  fi
+  if grep -q '^#define udp_tunnel_sock_release(' "$compat" \
+     && printf '%s\n' "$oneline" | grep -q 'udp_tunnel_sock_release *([^)]*struct sock \*'; then
+    sed -i 's/^#define udp_tunnel_sock_release(/#define awg_kmod_neutered_udp_tunnel_sock_release(/' "$compat"
+    patched="${patched:+${patched} and }udp_tunnel_sock_release"
+  fi
+  if [ -n "$patched" ]; then
+    log "Compat fix: neutralized upstream's stale ${patched} macro(s) for kernel $(uname -r) (signature read from ${KMOD_KERNEL_BUILD})."
+  fi
+  return 0
+}
+
 install_awg_kernel_module() { # $1 = tag
   local tag="$1"
   hdr "AmneziaWG kernel module (DKMS, optional): ${tag}"
@@ -742,6 +790,10 @@ install_awg_kernel_module() { # $1 = tag
   rm -rf "$dst"
   mkdir -p "$dst"
   cp -a "$src/src/." "$dst/"
+
+  # 6.13..7.1.4 kernels: fix upstream's stale udp_tunnel compat macros
+  # (no-op everywhere else) before the sources reach dkms.
+  kmod_neutralize_stale_udp_tunnel_macros "$dst"
 
   log "Building the module with dkms (a failure leaves the tunnels on userspace)..."
   if ! dkms add "${kname}/${kver}" >/dev/null 2>&1 \

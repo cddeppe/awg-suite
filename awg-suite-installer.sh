@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.12"
+SCRIPT_VERSION="1.0.13"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -157,6 +157,18 @@ SCRIPT_VERSION="1.0.12"
 #            driven: old kernels, 7.1.5+ and a fixed upstream tag all
 #            make the pass a silent no-op. Userspace fallback on build
 #            failure remains.
+#   v1.0.13 - Tunnel restarts actually fire now: wg-quick@.service and
+#            awg-quick@.service are Type=oneshot with RemainAfterExit, so
+#            a live tunnel unit sits in state "active (exited)", never
+#            "running" - every unit query that used --state=running (the
+#            v1.0.11 kernel-module switch AND the post-update awg/wg
+#            tunnel restarts) matched nothing. Caught on the first
+#            real-world module install (Ubuntu 26.04: module loaded, both
+#            tunnels still held by amneziawg-go); the test fixtures had
+#            stubbed "running" units. All tunnel-unit queries now use
+#            --state=active, and 'update' reconciles leftovers: when the
+#            module is loaded while amneziawg-go daemons still hold
+#            tunnels, they are restarted onto the kernel path.
 
 set -Eeuo pipefail
 
@@ -746,6 +758,25 @@ kmod_neutralize_stale_udp_tunnel_macros() { # $1 = flattened module source dir
   return 0
 }
 
+# Restart every live awg-quick tunnel onto the kernel module. wg-quick@.service
+# is Type=oneshot with RemainAfterExit: a live tunnel unit sits in state
+# "active (exited)", never "running" - the query must use --state=active or
+# it matches nothing (v1.0.11/1.0.12 asked for --state=running and never
+# restarted anything, leaving amneziawg-go holding the tunnels after a
+# successful module install - caught on the first real-world run).
+kmod_restart_tunnels_onto_module() {
+  local awg_units
+  awg_units=$(systemctl list-units --type=service --state=active --plain --no-legend 'awg-quick@*' 2>/dev/null | awk '{print $1}')
+  [ -n "$awg_units" ] || return 0
+  # shellcheck disable=SC2086
+  sysdo restart $awg_units \
+    && ok "Restarted onto the kernel module: ${awg_units//$'\n'/ }" \
+    || warn "Could not restart tunnels - they switch to the module on their next restart."
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x amneziawg-go >/dev/null 2>&1; then
+    warn "amneziawg-go is still running for some tunnel(s) - restart those units to switch them."
+  fi
+}
+
 install_awg_kernel_module() { # $1 = tag
   local tag="$1"
   hdr "AmneziaWG kernel module (DKMS, optional): ${tag}"
@@ -758,6 +789,13 @@ install_awg_kernel_module() { # $1 = tag
   if [ "${KERNEL_MODULE_TAG:-}" = "$tag" ] && command -v dkms >/dev/null 2>&1 \
      && dkms status 2>/dev/null | grep -q 'amneziawg/.*installed'; then
     ok "amneziawg kernel module ${tag} already installed - nothing to do."
+    # Reconcile leftovers from older installers: the module is installed and
+    # loaded, but userspace daemons still hold live tunnels - switch them now.
+    if [ -d "$AWG_SYS_MODULE_PATH" ] && command -v pgrep >/dev/null 2>&1 \
+       && pgrep -x amneziawg-go >/dev/null 2>&1; then
+      log "amneziawg-go still holds tunnel(s) although the kernel module is loaded - switching them."
+      kmod_restart_tunnels_onto_module
+    fi
     return 0
   fi
 
@@ -812,17 +850,7 @@ install_awg_kernel_module() { # $1 = tag
 
   if [ -d "$AWG_SYS_MODULE_PATH" ]; then
     ok "Kernel module loaded - awg-quick uses it instead of amneziawg-go."
-    local awg_units
-    awg_units=$(systemctl list-units --type=service --state=running --plain --no-legend 'awg-quick@*' 2>/dev/null | awk '{print $1}')
-    if [ -n "$awg_units" ]; then
-      # shellcheck disable=SC2086
-      sysdo restart $awg_units \
-        && ok "Restarted: ${awg_units//$'\n'/ }" \
-        || warn "Could not restart tunnels - they switch to the module on their next restart."
-    fi
-    if command -v pgrep >/dev/null 2>&1 && pgrep -x amneziawg-go >/dev/null 2>&1; then
-      warn "amneziawg-go is still running for some tunnel(s) - restart those units to switch them."
-    fi
+    kmod_restart_tunnels_onto_module
   else
     warn "Module installed but not loaded - tunnels keep using userspace until restarted."
   fi
@@ -2194,7 +2222,8 @@ cmd_update() {
     hdr "Restarting affected services"
     if [ "$changed_awg_go" -eq 1 ] || [ "$changed_awg_tools" -eq 1 ]; then
       local awg_units
-      awg_units=$(systemctl list-units --type=service --state=running --plain --no-legend 'awg-quick@*' 2>/dev/null | awk '{print $1}')
+      # tunnel units are oneshot+RemainAfterExit: live = "active (exited)"
+      awg_units=$(systemctl list-units --type=service --state=active --plain --no-legend 'awg-quick@*' 2>/dev/null | awk '{print $1}')
       if [ -n "$awg_units" ]; then
         # shellcheck disable=SC2086
         systemctl restart $awg_units 2>/dev/null \
@@ -2204,7 +2233,7 @@ cmd_update() {
     fi
     if [ "$changed_wg" -eq 1 ]; then
       local wg_units
-      wg_units=$(systemctl list-units --type=service --state=running --plain --no-legend 'wg-quick@*' 2>/dev/null | awk '{print $1}')
+      wg_units=$(systemctl list-units --type=service --state=active --plain --no-legend 'wg-quick@*' 2>/dev/null | awk '{print $1}')
       if [ -n "$wg_units" ]; then
         # shellcheck disable=SC2086
         systemctl restart $wg_units 2>/dev/null \

@@ -135,6 +135,11 @@ headers are not yet installed). `dkms.conf`'s `AUTOINSTALL=yes` builds the
 module for new kernels automatically. `update` keeps the module current with
 its upstream tag; `uninstall` removes it cleanly.
 
+When the module installs — or when `update` finds tunnels an older installer
+left on the userspace backend — live `awg-quick` tunnels are restarted onto
+it automatically (a brief blip per tunnel; clients re-handshake on their
+keepalive).
+
 On kernels 6.13–7.1.4 the installer applies a small compat fix to the module
 sources before building: upstream's compat gate rewrites both `udp_tunnel`
 call sites, but in that window `setup_udp_tunnel_sock()` already takes a

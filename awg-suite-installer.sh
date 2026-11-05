@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.0.9"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -111,6 +111,17 @@ SCRIPT_VERSION="1.0.8"
 #            clamped. Timestamped backups next to each file, repaired
 #            tunnels restart, and a warning names the H values whose client
 #            configs must be updated to match.
+#   v1.0.9 - Update verifies components instead of trusting the state file:
+#            'update' now checks that the binaries actually exist
+#            (amneziawg-go, awg, awg-quick) and reinstalls any component
+#            that vanished while the state file still recorded it as
+#            installed (e.g. an apt purge of the old Amnezia packages
+#            removes the deb-owned awg/awg-quick while the suite's records
+#            still show them). Fixes: update printing "amneziawg-tools is
+#            up to date" on a box where 'awg-quick: command not found'.
+#            After a self-update the installer now re-execs the updated
+#            script immediately, so the new logic applies to the very run
+#            that downloaded it.
 
 set -Eeuo pipefail
 
@@ -123,6 +134,14 @@ REPO_DASHBOARD="https://github.com/WGDashboard/WGDashboard"
 # (e.g. no network access to github.com).
 AWG_GO_FALLBACK_TAG="v3.1.20260828"
 AWG_TOOLS_FALLBACK_TAG="v3.1.20260812"
+
+# Component binary locations - the update logic verifies these exist,
+# because packages can remove files behind the state file's back (e.g. an
+# apt purge of the Amnezia debs removes the deb-owned awg/awg-quick).
+# Overridable so tests can point them at fixtures.
+AWG_GO_BIN="${AWG_GO_BIN:-/usr/bin/amneziawg-go}"
+AWG_BIN="${AWG_BIN:-/usr/bin/awg}"
+AWG_QUICK_BIN="${AWG_QUICK_BIN:-/usr/bin/awg-quick}"
 DASHBOARD_FALLBACK_TAG_PY312="v4.3.3"    # needs python >= 3.12, has AWG support
 DASHBOARD_FALLBACK_TAG_PY310="v4.2.5"    # python 3.10 / 3.11
 
@@ -564,12 +583,19 @@ install_wireguard() {
   ok "Tunnel config directory: /etc/wireguard"
 }
 
+# ------------------------------------------------------------------ binary presence
+# The state file records what this suite installed, but apt can remove
+# deb-owned binaries behind its back. Component decisions must therefore
+# also verify the binaries exist, not just trust the recorded tag.
+awg_go_binary_missing() { [ ! -x "$AWG_GO_BIN" ]; }
+awg_tools_binaries_missing() { [ ! -x "$AWG_BIN" ] || [ ! -x "$AWG_QUICK_BIN" ]; }
+
 # ------------------------------------------------------------------ amneziawg-go
 install_awg_go() { # $1 = tag
   local tag="$1"
   hdr "AmneziaWG userspace backend: amneziawg-go ${tag}"
 
-  if [ "$OPT_FORCE" -eq 0 ] && [ "$AWG_GO_TAG" = "$tag" ] && [ -x /usr/bin/amneziawg-go ]; then
+  if [ "$OPT_FORCE" -eq 0 ] && [ "$AWG_GO_TAG" = "$tag" ] && [ -x "$AWG_GO_BIN" ]; then
     ok "amneziawg-go ${tag} already installed - nothing to do."
     return 0
   fi
@@ -597,7 +623,7 @@ install_awg_tools() { # $1 = tag
   local tag="$1"
   hdr "AmneziaWG tools: awg / awg-quick ${tag}"
 
-  if [ "$OPT_FORCE" -eq 0 ] && [ "$AWG_TOOLS_TAG" = "$tag" ] && [ -x /usr/bin/awg ] && [ -x /usr/bin/awg-quick ]; then
+  if [ "$OPT_FORCE" -eq 0 ] && [ "$AWG_TOOLS_TAG" = "$tag" ] && [ -x "$AWG_BIN" ] && [ -x "$AWG_QUICK_BIN" ]; then
     ok "amneziawg-tools ${tag} already installed - nothing to do."
     return 0
   fi
@@ -1782,6 +1808,14 @@ self_update() {
   fi
   install -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"
   ok "Installer script updated to the latest version from the repo."
+  # Re-exec so THIS run immediately uses the updated logic (without this,
+  # a fix shipped for a broken update path only takes effect on the NEXT
+  # run - the broken run keeps running the old code it already loaded).
+  # SCRIPT_ARGS is always set by main() before update runs; the
+  # ${arr[@]+"${arr[@]}"} idiom forwards zero-or-more args safely.
+  log "Re-executing updated installer: ${SCRIPT_ARGS[*]:-<install>}"
+  # shellcheck disable=SC2068
+  exec bash "$SCRIPT_INSTALL_PATH" ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}
 }
 
 install_self() {
@@ -1891,6 +1925,12 @@ cmd_update() {
 
   hdr "Updating AWG suite"
   log "Installed: amneziawg-go ${AWG_GO_TAG} | amneziawg-tools ${AWG_TOOLS_TAG} | dashboard ${DASHBOARD_TAG}"
+  if awg_go_binary_missing; then
+    warn "State mismatch: ${AWG_GO_BIN} is missing (state records ${AWG_GO_TAG:-none}) - it will be reinstalled."
+  fi
+  if awg_tools_binaries_missing; then
+    warn "State mismatch: ${AWG_BIN} and/or ${AWG_QUICK_BIN} missing (state records ${AWG_TOOLS_TAG:-none}) - amneziawg-tools will be reinstalled."
+  fi
 
   local changed_wg=0 changed_awg_go=0 changed_awg_tools=0 changed_dash=0
 
@@ -1912,8 +1952,11 @@ cmd_update() {
 
   local tag
   tag="${OPT_AWG_GO_TAG:-$(latest_awg_go_tag)}"
-  if [ "$tag" != "$AWG_GO_TAG" ] || [ "$OPT_FORCE" -eq 1 ]; then
+  if [ "$tag" != "$AWG_GO_TAG" ] || [ "$OPT_FORCE" -eq 1 ] || awg_go_binary_missing; then
     log "amneziawg-go: ${AWG_GO_TAG:-none} -> ${tag}"
+    if awg_go_binary_missing; then
+      log "Reason: ${AWG_GO_BIN} is missing on disk despite being recorded as installed."
+    fi
     install_awg_go "$tag"
     changed_awg_go=1
   else
@@ -1921,8 +1964,11 @@ cmd_update() {
   fi
 
   tag="${OPT_AWG_TOOLS_TAG:-$(latest_awg_tools_tag)}"
-  if [ "$tag" != "$AWG_TOOLS_TAG" ] || [ "$OPT_FORCE" -eq 1 ]; then
+  if [ "$tag" != "$AWG_TOOLS_TAG" ] || [ "$OPT_FORCE" -eq 1 ] || awg_tools_binaries_missing; then
     log "amneziawg-tools: ${AWG_TOOLS_TAG:-none} -> ${tag}"
+    if awg_tools_binaries_missing; then
+      log "Reason: ${AWG_BIN} and/or ${AWG_QUICK_BIN} missing on disk despite being recorded as installed (package purge?)."
+    fi
     install_awg_tools "$tag"
     changed_awg_tools=1
   else
@@ -2248,6 +2294,7 @@ parse_args() {
 main() {
   setup_colors
   local original_args=("$@")
+  SCRIPT_ARGS=("$@")   # global: lets self_update re-exec with the same command
   parse_args "$@"
 
   case "$CMD" in

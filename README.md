@@ -105,6 +105,15 @@ Each modified file is backed up next to itself
 any `H` values that changed — client configs must use the same `H1`–`H4`.
 The pass is skipped while the amneziawg kernel module is loaded.
 
+**Binary verification on update (v1.0.9).** `update` no longer trusts the
+suite's state file alone: it verifies `amneziawg-go`, `awg` and `awg-quick`
+actually exist on disk and reinstalls any component that vanished while still
+being recorded as installed (e.g. `apt` removing the old Amnezia packages
+takes the deb-owned `awg`/`awg-quick` with it, leaving
+`awg-quick: command not found` even though the state file says the tools are
+installed). After a self-update the installer also re-runs the freshly
+downloaded script immediately, so the new logic applies to the same run.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it

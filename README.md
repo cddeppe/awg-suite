@@ -118,6 +118,23 @@ downloaded script immediately, so the new logic applies to the same run.
 file descriptor survived the re-exec — the lock is now released before it,
 and a second instance waits up to 15 s instead of failing instantly.)
 
+## Optional: AmneziaWG kernel module (faster)
+
+The suite runs AWG tunnels on the userspace `amneziawg-go` backend by
+default. Add `--kernel-module` to install the upstream amneziawg DKMS kernel
+module (`amnezia-vpn/amneziawg-linux-kernel-module` — the same 3.1 release
+train as the tools, actively maintained, builds against current kernels
+including 7.x) for noticeably higher throughput, especially on weaker CPUs.
+
+Safety properties: sources are flattened into `/usr/src` exactly like
+upstream's own packaging and registered with plain DKMS (no apt packages
+involved, so a failed build can never wedge `dpkg`); a build failure just
+leaves the tunnels on userspace; and `awg-quick` automatically falls back to
+`amneziawg-go` whenever the module is absent (e.g. a future kernel whose
+headers are not yet installed). `dkms.conf`'s `AUTOINSTALL=yes` builds the
+module for new kernels automatically. `update` keeps the module current with
+its upstream tag; `uninstall` removes it cleanly.
+
 ## Automatic updates
 
 `install` enables `awg-suite-update.timer`: every Sunday ~04:00 (±45 min) it

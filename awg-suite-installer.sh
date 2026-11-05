@@ -59,7 +59,7 @@
 # AWG_SUITE_INSTALLER=1  (marker used by the self-update sanity check)
 # shellcheck disable=SC2034
 AWG_SUITE_INSTALLER=1
-SCRIPT_VERSION="1.0.10"
+SCRIPT_VERSION="1.0.11"
 #
 # Changelog:
 #   v1.0.4 - Adoption & standardization: 'install' and 'status' now scan for
@@ -131,6 +131,19 @@ SCRIPT_VERSION="1.0.10"
 #            of aborting instantly - which also self-heals the one-time
 #            v1.0.9 -> v1.0.10 transition, where the still-running v1.0.9
 #            image cannot release the lock itself.
+#   v1.0.11 - Optional amneziawg kernel module (DKMS): '--kernel-module'
+#            installs the upstream amneziawg-linux-kernel-module (same 3.1
+#            release train as the tools, actively maintained, builds against
+#            current kernels incl. 7.x) for significantly higher throughput
+#            than the userspace amneziawg-go backend. Failure-safe: sources
+#            are flattened into /usr/src like upstream's own packaging, a
+#            failed build simply leaves the tunnels on userspace, no apt
+#            packages are involved (dpkg can never wedge), and awg-quick
+#            falls back to amneziawg-go automatically whenever the module
+#            is absent. 'update' keeps the module current; 'uninstall'
+#            removes it cleanly. Also fixes adopt_clean_path creating an
+#            EMPTY pre-adopt-<timestamp> backup directory on every re-run
+#            on an already-clean box (backup creation is now lazy).
 
 set -Eeuo pipefail
 
@@ -151,6 +164,14 @@ AWG_TOOLS_FALLBACK_TAG="v3.1.20260812"
 AWG_GO_BIN="${AWG_GO_BIN:-/usr/bin/amneziawg-go}"
 AWG_BIN="${AWG_BIN:-/usr/bin/awg}"
 AWG_QUICK_BIN="${AWG_QUICK_BIN:-/usr/bin/awg-quick}"
+
+# Optional amneziawg kernel module (DKMS) - faster than userspace amneziawg-go.
+# Same 3.1 release train as amneziawg-tools; actively maintained upstream.
+REPO_AWG_KMOD="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
+AWG_KMOD_FALLBACK_TAG="v3.1.20260906"
+# Overridable paths (tests point them at fixtures)
+KMOD_SRC_ROOT="${KMOD_SRC_ROOT:-/usr/src}"
+AWG_SYS_MODULE_PATH="${AWG_SYS_MODULE_PATH:-/sys/module/amneziawg}"
 DASHBOARD_FALLBACK_TAG_PY312="v4.3.3"    # needs python >= 3.12, has AWG support
 DASHBOARD_FALLBACK_TAG_PY310="v4.2.5"    # python 3.10 / 3.11
 
@@ -198,6 +219,8 @@ OPT_DASHBOARD=1
 OPT_AUTO_UPDATE=1
 OPT_AWG_GO_TAG=""
 OPT_AWG_TOOLS_TAG=""
+OPT_KERNEL_MODULE=0
+OPT_KMOD_TAG=""
 OPT_DASHBOARD_TAG=""
 OPT_GO_VERSION="$GO_PINNED_VERSION"
 OPT_FORCE=0
@@ -219,7 +242,7 @@ HAVE_SYSTEMD=0
 PRIMARY_IP=""
 
 # State (persisted to $STATE_DIR/state.env)
-AWG_GO_TAG="" AWG_TOOLS_TAG="" DASHBOARD_TAG=""
+AWG_GO_TAG="" AWG_TOOLS_TAG="" DASHBOARD_TAG="" KERNEL_MODULE_TAG=""
 GO_INSTALLED_BY_US=0 GO_VERSION_INSTALLED=""
 SEEDED_WG=0 SEEDED_AWG=0
 APT_PACKAGES=""
@@ -417,6 +440,7 @@ save_state() {
 # Managed by awg-suite-installer.sh - do not edit while the installer runs.
 AWG_GO_TAG='${AWG_GO_TAG}'
 AWG_TOOLS_TAG='${AWG_TOOLS_TAG}'
+KERNEL_MODULE_TAG='${KERNEL_MODULE_TAG}'
 DASHBOARD_TAG='${DASHBOARD_TAG}'
 GO_INSTALLED_BY_US=${GO_INSTALLED_BY_US}
 GO_VERSION_INSTALLED='${GO_VERSION_INSTALLED}'
@@ -476,6 +500,7 @@ git_latest_tag() {
 
 latest_awg_go_tag()   { git_latest_tag "$REPO_AWG_GO" || printf '%s\n' "$AWG_GO_FALLBACK_TAG"; }
 latest_awg_tools_tag(){ git_latest_tag "$REPO_AWG_TOOLS" || printf '%s\n' "$AWG_TOOLS_FALLBACK_TAG"; }
+latest_awg_kmod_tag() { git_latest_tag "$REPO_AWG_KMOD" || printf '%s\n' "$AWG_KMOD_FALLBACK_TAG"; }
 
 # WGDashboard tag depends on the available python3 (v4.3+ requires >= 3.12)
 latest_dashboard_tag() {
@@ -666,6 +691,88 @@ install_awg_tools() { # $1 = tag
     ok "Systemd unit awg-quick@.service installed."
   else
     warn "awg-quick@.service was not installed (no systemd unit dir?) - tunnels can still be started manually."
+  fi
+}
+
+# ------------------------------------------------------ amneziawg kernel module
+# Optional DKMS kernel module: faster than the userspace amneziawg-go
+# backend. Opt-in (--kernel-module) or automatic once installed (state).
+# Failure-safe by design: any problem leaves the tunnels on userspace.
+install_awg_kernel_module() { # $1 = tag
+  local tag="$1"
+  hdr "AmneziaWG kernel module (DKMS, optional): ${tag}"
+
+  if [ "$OPT_KERNEL_MODULE" -eq 0 ] && [ -z "${KERNEL_MODULE_TAG:-}" ]; then
+    log "Kernel module not requested - userspace amneziawg-go carries the tunnels."
+    return 0
+  fi
+
+  if [ "${KERNEL_MODULE_TAG:-}" = "$tag" ] && command -v dkms >/dev/null 2>&1 \
+     && dkms status 2>/dev/null | grep -q 'amneziawg/.*installed'; then
+    ok "amneziawg kernel module ${tag} already installed - nothing to do."
+    return 0
+  fi
+
+  if ! command -v dkms >/dev/null 2>&1; then
+    log "Installing dkms + kernel headers for $(uname -r)..."
+    if ! ensure_packages dkms "linux-headers-$(uname -r)"; then
+      warn "Could not install dkms/headers - staying on userspace amneziawg-go."
+      return 0
+    fi
+  fi
+
+  make_tmpdir
+  local src="${TMPDIR_AWG}/amneziawg-kmod"
+  log "Cloning ${REPO_AWG_KMOD} (tag ${tag})..."
+  git clone -q --depth 1 --branch "$tag" "$REPO_AWG_KMOD" "$src"
+
+  # Upstream keeps dkms.conf in src/; DKMS wants it at the tree top. Flatten
+  # src/ into /usr/src/<name>-<ver>/ exactly like upstream's own packaging.
+  local kname kver
+  kname=$(sed -n 's/^PACKAGE_NAME="\([^"]*\)".*/\1/p' "$src/src/dkms.conf" | head -1)
+  kver=$(sed -n 's/^PACKAGE_VERSION="\([^"]*\)".*/\1/p' "$src/src/dkms.conf" | head -1)
+  if [ -z "$kname" ] || [ -z "$kver" ]; then
+    warn "Could not parse PACKAGE_NAME/VERSION from dkms.conf - staying on userspace."
+    return 0
+  fi
+
+  local dst="${KMOD_SRC_ROOT}/${kname}-${kver}"
+  log "Installing module sources to ${dst} (flattened from the repo's src/)..."
+  dkms remove "${kname}/${kver}" --all >/dev/null 2>&1 || true
+  rm -rf "$dst"
+  mkdir -p "$dst"
+  cp -a "$src/src/." "$dst/"
+
+  log "Building the module with dkms (a failure leaves the tunnels on userspace)..."
+  if ! dkms add "${kname}/${kver}" >/dev/null 2>&1 \
+     || ! dkms build "${kname}/${kver}" >/dev/null 2>&1 \
+     || ! dkms install "${kname}/${kver}" >/dev/null 2>&1; then
+    warn "dkms build/install of ${kname}/${kver} failed - staying on userspace amneziawg-go."
+    log "Build log: /var/lib/dkms/${kname}/${kver}/build/make.log"
+    return 0
+  fi
+
+  KERNEL_MODULE_TAG="$tag"
+  ok "Installed dkms module ${kname}/${kver} (upstream ${tag})."
+
+  modprobe "$kname" 2>/dev/null \
+    || warn "modprobe ${kname} failed - the module will load on the next boot."
+
+  if [ -d "$AWG_SYS_MODULE_PATH" ]; then
+    ok "Kernel module loaded - awg-quick uses it instead of amneziawg-go."
+    local awg_units
+    awg_units=$(systemctl list-units --type=service --state=running --plain --no-legend 'awg-quick@*' 2>/dev/null | awk '{print $1}')
+    if [ -n "$awg_units" ]; then
+      # shellcheck disable=SC2086
+      sysdo restart $awg_units \
+        && ok "Restarted: ${awg_units//$'\n'/ }" \
+        || warn "Could not restart tunnels - they switch to the module on their next restart."
+    fi
+    if command -v pgrep >/dev/null 2>&1 && pgrep -x amneziawg-go >/dev/null 2>&1; then
+      warn "amneziawg-go is still running for some tunnel(s) - restart those units to switch them."
+    fi
+  else
+    warn "Module installed but not loaded - tunnels keep using userspace until restarted."
   fi
 }
 
@@ -986,7 +1093,10 @@ adopt_awg_configs() {
 
 adopt_clean_path() {
   local d b found=0
-  pre_adopt_backup
+  # v1.0.11: the backup dir is created lazily (inside the loop, via
+  # move_to_backup) - an eager pre_adopt_backup here used to create an
+  # EMPTY pre-adopt-<timestamp> dir on every re-run of install/update
+  # on an already-clean box.
   for d in $SHADOW_BIN_DIRS_DEFAULT; do
     [ -d "$d" ] || continue
     for b in wg wg-quick awg awg-quick amneziawg-go; do
@@ -1920,6 +2030,7 @@ cmd_install() {
   install_wireguard
   install_awg_go "${OPT_AWG_GO_TAG:-$(latest_awg_go_tag)}"
   install_awg_tools "${OPT_AWG_TOOLS_TAG:-$(latest_awg_tools_tag)}"
+  install_awg_kernel_module "${OPT_KMOD_TAG:-$(latest_awg_kmod_tag)}"
   if [ "$OPT_DASHBOARD" -eq 1 ]; then
     install_dashboard "$(dashboard_target_tag)"
     install_dashboard_service
@@ -1994,6 +2105,15 @@ cmd_update() {
     changed_awg_tools=1
   else
     ok "amneziawg-tools ${AWG_TOOLS_TAG} is up to date."
+  fi
+
+  if [ "$OPT_KERNEL_MODULE" -eq 1 ] || [ -n "${KERNEL_MODULE_TAG:-}" ]; then
+    tag="${OPT_KMOD_TAG:-$(latest_awg_kmod_tag)}"
+    if [ "$tag" != "${KERNEL_MODULE_TAG:-}" ] || [ "$OPT_FORCE" -eq 1 ]; then
+      install_awg_kernel_module "$tag"
+    else
+      ok "amneziawg kernel module ${KERNEL_MODULE_TAG} is up to date."
+    fi
   fi
 
   if [ "$OPT_DASHBOARD" -eq 1 ] && [ -d "$DASHBOARD_DIR/.git" ]; then
@@ -2098,6 +2218,18 @@ cmd_uninstall() {
     else
       warn "Dashboard backup incomplete (no database yet?)."
     fi
+  fi
+
+  if command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -q '^amneziawg/'; then
+    hdr "Removing amneziawg kernel module"
+    local kmod_id
+    kmod_id=$(dkms status 2>/dev/null | sed -n 's/^\(amneziawg\/[^,]*\),.*/\1/p' | head -1)
+    if [ -n "$kmod_id" ]; then
+      dkms remove "$kmod_id" --all >/dev/null 2>&1 || true
+      ok "Removed dkms module ${kmod_id}."
+    fi
+    rm -rf "${KMOD_SRC_ROOT}"/amneziawg-*/ 2>/dev/null || true
+    modprobe -r amneziawg >/dev/null 2>&1 || true
   fi
 
   hdr "Removing files"
@@ -2224,6 +2356,9 @@ Options:
   --no-auto-update       do not install the weekly auto-update timer
   --awg-go-tag TAG       pin amneziawg-go to an upstream tag
   --awg-tools-tag TAG    pin amneziawg-tools to an upstream tag
+  --kernel-module       install the amneziawg DKMS kernel module (faster
+                        than userspace; auto-falls-back if absent)
+  --kmod-tag TAG        pin the kernel module to an upstream tag
   --dashboard-tag TAG    pin WGDashboard to an upstream tag
   --go-version V         use a specific Go toolchain version
   --force                rebuild/reinstall even when up to date
@@ -2286,6 +2421,7 @@ parse_args() {
           --awg-go-tag)      OPT_AWG_GO_TAG="$2" ;;
           --awg-tools-tag)   OPT_AWG_TOOLS_TAG="$2" ;;
           --dashboard-tag)   OPT_DASHBOARD_TAG="$2" ;;
+          --kmod-tag)        OPT_KMOD_TAG="$2" ;;
           --go-version)      OPT_GO_VERSION="$2" ;;
           --adopt-dashboard-from) OPT_ADOPT_DASH_FROM="$2" ;;
         esac
@@ -2294,6 +2430,7 @@ parse_args() {
       --no-dashboard)    OPT_DASHBOARD=0; shift ;;
       --no-adopt)        OPT_NO_ADOPT=1; shift ;;
       --no-auto-update)  OPT_AUTO_UPDATE=0; shift ;;
+      --kernel-module)   OPT_KERNEL_MODULE=1; shift ;;
       --force)           OPT_FORCE=1; shift ;;
       --no-self-update)  OPT_SELF_UPDATE=0; shift ;;
       --auto)            OPT_AUTO=1; shift ;;
